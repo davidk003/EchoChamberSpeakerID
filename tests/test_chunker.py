@@ -1325,3 +1325,36 @@ def test_reconfigure_to_an_oversized_window_is_rejected_and_leaves_config_intact
     write_ramp(ring, 0, cfg.window_frames)
     assert collector.wait_for_count(1), "stream must still work after a rejected reconfigure"
     assert collector.chunks[0].start_frame == 0
+
+
+# --------------------------------------------------------------------------
+# __repr__
+#
+# Regression: __repr__ read a `_config` attribute that was renamed to `_state`,
+# so repr() raised AttributeError. Debug helpers are exactly the code that is
+# never exercised until you need it at 2am, so it gets a test.
+# --------------------------------------------------------------------------
+
+
+def test_repr_works_and_reports_geometry() -> None:
+    cfg = make_config(100, 40)
+    ring = RingBuffer(cfg.ring_frames)
+    ch = WindowChunker(ring, cfg, lambda chunk: None, name="reprtest")
+
+    text = repr(ch)  # must not raise
+
+    assert "reprtest" in text
+    assert "window_frames=100" in text
+    assert "hop_frames=40" in text
+    assert "running=False" in text
+
+
+def test_repr_reflects_a_reconfigured_geometry() -> None:
+    cfg = make_config(100, 40)
+    ring = RingBuffer(cfg.ring_frames)
+    ch = WindowChunker(ring, cfg, lambda chunk: None)
+
+    ch.reconfigure(make_config(50, 25))
+
+    text = repr(ch)
+    assert "window_frames=50" in text and "hop_frames=25" in text

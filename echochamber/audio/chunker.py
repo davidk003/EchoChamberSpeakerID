@@ -319,7 +319,7 @@ class WindowChunker:
 
     def __repr__(self) -> str:
         """Return a debugging representation of the chunker's state."""
-        cfg = self._config
+        cfg = self._state[0]
         return (
             f"{type(self).__name__}(name={self._name!r}, "
             f"window_frames={cfg.window_frames}, hop_frames={cfg.hop_frames}, "

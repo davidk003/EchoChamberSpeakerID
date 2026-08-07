@@ -168,7 +168,16 @@ the single most common failure mode in this kind of system.
 
 ### 3.5 Sources (`audio/sources/`)
 
-`AudioSource` interface: `start(callback)`, `stop()`, `sample_rate`, `channels`.
+`AudioSource` interface: `start()`, `stop()`, `sample_rate`, `channels`, `finished`. The audio
+callback and the shared `StreamStats` are injected at construction.
+
+The pipeline builds its source through a `SourceFactory`, which it calls with **both**
+`ring.write` and its own `StreamStats`. Passing the writer is what keeps a source ignorant of
+the ring. Passing the stats is not optional bookkeeping: the source is the only component that
+ever sees raw audio, so it is the only one that can fill in `frames_captured`, `peak_level` and
+`rms_level`. An earlier design left the caller to thread the same instance into both places,
+which failed silently — the pipeline ran perfectly and the meters simply never moved, looking
+like a dead input device rather than a wiring mistake.
 
 - `SoundDeviceSource` — live capture. Also owns device enumeration and xrun counting via
   PortAudio's `status` flags (`input_overflow`).
@@ -261,7 +270,9 @@ becomes a problem.
 
 1. ~~`types.py`, `config.py`, `ringbuffer.py` + tests~~ — **done** (288 tests passing)
 2. ~~`chunker.py` + ramp tests (no audio device needed yet)~~ — **done** (353 tests passing)
-3. `sinks.py`, `pipeline.py`, `file_source.py` — full pipeline testable headless
+3. ~~`sinks.py`, `pipeline.py`, `file_source.py` — full pipeline testable headless~~ —
+   **done** (506 tests passing; a WAV replays end-to-end through the real ring, chunker,
+   bounded queue and consumer thread)
 4. `sounddevice_source.py` + device enumeration — first live audio
 5. GUI: device panel, start/stop, meters, stats
 6. Latency instrumentation + a stub consumer standing in for the ML stage
