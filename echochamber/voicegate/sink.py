@@ -60,8 +60,8 @@ from typing import Callable
 
 from echochamber.audio.sinks import new_frame_count
 from echochamber.audio.types import AudioChunk
-from echochamber.voicegate.config import VoiceGateConfig
-from echochamber.voicegate.matching import PhraseMatch, match_phrase
+from echochamber.voicegate.config import ClipMode, VoiceGateConfig
+from echochamber.voicegate.matching import PhraseMatch, locate_phrase, match_phrase
 from echochamber.voicegate.recognizer import (
     NullRecognizer,
     Recognition,
@@ -192,6 +192,14 @@ class VoiceGateStats:
         snippets_truncated: Snippets cut short by the maximum-length ceiling.
         gaps: Chunks that started past the expected frame, i.e. times audio was
             lost upstream.  Non-zero means the snippets may have holes.
+        clips_located: Snippets cut to the phrase using the decoder's word
+            timings -- the intended path in
+            :attr:`~echochamber.voicegate.config.ClipMode.PHRASE`.
+        clips_fallback: Snippets that fell back to the fixed window because no
+            usable timings arrived.  **Watch this one.**  A backend that never
+            reports timings makes it climb in lockstep with
+            ``snippets_written``, and every clip is then a wide guess rather
+            than the hotword -- which looks fine until someone listens.
         last_phrase: Most recently matched phrase, empty before the first.
         last_snippet_path: Path of the most recently completed snippet, or
             ``None`` before the first.
@@ -205,6 +213,8 @@ class VoiceGateStats:
     snippets_suppressed: int = 0
     snippets_truncated: int = 0
     gaps: int = 0
+    clips_located: int = 0
+    clips_fallback: int = 0
     last_phrase: str = ""
     last_snippet_path: str | None = None
     error: str | None = None
@@ -248,6 +258,12 @@ class VoiceGateSink:
         "_post_roll_frames",
         "_max_snippet_frames",
         "_cooldown_frames",
+        "_clip_mode",
+        "_lead_frames",
+        "_trail_frames",
+        "_fed_frames",
+        "_anchor_fed",
+        "_anchor_abs",
         "_pre_roll",
         "_next_expected",
         "_writer",
@@ -269,6 +285,8 @@ class VoiceGateSink:
         "_gaps",
         "_last_phrase",
         "_last_snippet_path",
+        "_clips_located",
+        "_clips_fallback",
         "_error",
     )
 
@@ -329,9 +347,22 @@ class VoiceGateSink:
         self._post_roll_frames: int = config.post_roll_frames(sample_rate)
         self._max_snippet_frames: int = config.max_snippet_frames(sample_rate)
         self._cooldown_frames: int = config.cooldown_frames(sample_rate)
+        self._clip_mode: ClipMode = config.clip_mode
+        self._lead_frames: int = config.lead_frames(sample_rate)
+        self._trail_frames: int = config.trail_frames(sample_rate)
+        # Sized from the lookback rather than the pre-roll: locating a phrase
+        # means reaching back past the decoder's reporting lag, which is far
+        # longer than anything that ends up in the file.
         self._pre_roll: PreRollBuffer = PreRollBuffer(
-            config.pre_roll_frames(sample_rate) * _BYTES_PER_FRAME
+            config.lookback_frames(sample_rate) * _BYTES_PER_FRAME
         )
+        # Vosk's word times count from the first sample it was ever fed, and
+        # survive Reset().  The anchor maps that clock onto absolute stream
+        # frames, and is re-taken whenever audio is skipped -- after which the
+        # two clocks differ by exactly the audio the recogniser never saw.
+        self._fed_frames: int = 0
+        self._anchor_fed: int = 0
+        self._anchor_abs: int | None = None
 
         self._next_expected: int | None = None
         self._writer: SnippetWriter | None = None
@@ -355,6 +386,8 @@ class VoiceGateSink:
         self._gaps: int = 0
         self._last_phrase: str = ""
         self._last_snippet_path: str | None = None
+        self._clips_located: int = 0
+        self._clips_fallback: int = 0
         self._error: str | None = None
 
     @property
@@ -409,6 +442,18 @@ class VoiceGateSink:
             return self._gaps
 
     @property
+    def clips_located(self) -> int:
+        """Snippets cut to the phrase using the decoder's word timings."""
+        with self._lock:
+            return self._clips_located
+
+    @property
+    def clips_fallback(self) -> int:
+        """Snippets that fell back to a fixed window for want of timings."""
+        with self._lock:
+            return self._clips_fallback
+
+    @property
     def last_phrase(self) -> str:
         """Most recently matched phrase; empty before the first match."""
         with self._lock:
@@ -459,6 +504,8 @@ class VoiceGateSink:
                 snippets_suppressed=self._snippets_suppressed,
                 snippets_truncated=self._snippets_truncated,
                 gaps=self._gaps,
+                clips_located=self._clips_located,
+                clips_fallback=self._clips_fallback,
                 last_phrase=self._last_phrase,
                 last_snippet_path=self._last_snippet_path,
                 error=self._error,
@@ -529,18 +576,28 @@ class VoiceGateSink:
             if gap > 0:
                 self._gaps += 1
 
-        if chunk.discontinuous:
+        if chunk.discontinuous or gap > 0:
             # The decoder's state describes audio that no longer connects to
-            # what follows, and the buffered pre-roll would splice across the
-            # hole; both are dropped rather than carried over the seam.
+            # what follows, and the buffered audio would splice across the
+            # hole; both are dropped rather than carried over the seam.  The
+            # anchor is re-taken because from here the recogniser's clock and
+            # the stream differ by exactly the frames it never received.
             self._reset_recognizer()
             self._pre_roll.clear()
+            self._anchor_fed = self._fed_frames
+            self._anchor_abs = chunk.start_frame
 
         if n_new <= 0:
             return
 
+        if self._anchor_abs is None:
+            # First audio: the recogniser's clock starts here.
+            self._anchor_abs = chunk.start_frame + chunk.n_frames - n_new
+
         tail = chunk.samples[chunk.n_frames - n_new :]
         pcm = float32_to_pcm16(tail)
+        # Appended before recognition, so the audio a phrase is found in is
+        # already retained by the time the gate goes looking for it.
         self._pre_roll.append(pcm)
 
         if self._writer is not None:
@@ -548,20 +605,26 @@ class VoiceGateSink:
         elif self._frames_since_snippet is not None:
             self._frames_since_snippet += n_new
 
-        for result in self._recognize(pcm):
+        results = self._recognize(pcm)
+        self._fed_frames += n_new
+        for result in results:
             # Finals only, and empty finals are the normal sound of silence.
             if not result.final or not result.text:
                 continue
             found = match_phrase(result.text, self._phrases)
             if found is not None:
-                self._on_match(found, result.text)
+                self._on_match(found, result.text, result)
 
-    def _on_match(self, found: PhraseMatch, text: str) -> None:
+    def _on_match(
+        self, found: PhraseMatch, text: str, recognition: Recognition
+    ) -> None:
         """Open, extend or suppress a snippet for one matched phrase.
 
         Args:
             found: The phrase located in ``text``.
             text: The full recognised text, stored on the resulting event.
+            recognition: The result the phrase came from, carrying the per-word
+                timings that let the snippet be cut to the phrase itself.
         """
         with self._lock:
             self._phrases_detected += 1
@@ -586,22 +649,83 @@ class VoiceGateSink:
             self._emit_detected(found, text, extended=True)
             return
 
-        self._open_snippet(found, text)
+        self._open_snippet(found, text, recognition)
         # After the snippet is open, so the event carries the seq of the file
         # this detection actually belongs to rather than the previous one's.
         self._emit_detected(found, text, extended=False)
 
-    def _open_snippet(self, found: PhraseMatch, text: str) -> None:
-        """Start a new snippet file and prime it with the pre-roll.
+    def _locate_phrase(
+        self, found: PhraseMatch, recognition: Recognition
+    ) -> tuple[int, int] | None:
+        """Map a matched phrase onto absolute stream frames, or give up.
 
-        The pre-roll snapshot **already contains the current chunk's PCM**: it
-        was appended before recognition ran, precisely so the audio the phrase
-        was heard in is in the file.  The chunk is therefore not written again
-        here, and doing so would duplicate a hop of audio.
+        Vosk reports per-word times counted from the first sample it was ever
+        fed (see :class:`~echochamber.voicegate.recognizer.WordTiming`), so a
+        word's position in the stream is ``anchor_abs + (word_frame -
+        anchor_fed)`` -- the anchor absorbing any audio the recogniser was never
+        given.
+
+        **The result is checked before it is trusted.**  A timing that lands in
+        the future, before the stream began, or outside the retained audio means
+        some assumption here is wrong -- a decoder whose clock does not behave as
+        documented, a lookback too short for the reporting lag -- and cutting on
+        it would produce a confidently mislabelled snippet of the wrong moment.
+        Returning ``None`` costs a wider clip; trusting bad arithmetic costs a
+        wrong one.
+
+        Args:
+            found: The matched phrase.
+            recognition: The result it came from.
+
+        Returns:
+            ``(start_frame, end_frame)`` in absolute stream frames, padded by
+            ``lead_ms`` and ``trail_ms``, or ``None`` to fall back to a window.
+        """
+        if self._clip_mode is not ClipMode.PHRASE or self._anchor_abs is None:
+            return None
+        span = locate_phrase(found, recognition.words)
+        if span is None:
+            return None
+
+        start_s, end_s = span
+        offset = self._anchor_abs - self._anchor_fed
+        start = int(round(start_s * self._sample_rate)) + offset
+        end = int(round(end_s * self._sample_rate)) + offset
+        if end <= start:
+            return None
+
+        start -= self._lead_frames
+        end += self._trail_frames
+
+        current = self._next_expected or 0
+        oldest = current - (self._pre_roll.size // _BYTES_PER_FRAME)
+        # The phrase itself must be retained; the trailing pad may still be in
+        # the future, and streaming fills that in.
+        if start < oldest or start >= current:
+            return None
+        if end - start > self._max_snippet_frames:
+            end = start + self._max_snippet_frames
+        return start, end
+
+    def _open_snippet(
+        self, found: PhraseMatch, text: str, recognition: Recognition
+    ) -> None:
+        """Start a new snippet file, cut to the phrase when that is possible.
+
+        Two paths.  With usable word timings the file begins at the phrase --
+        ``lead_ms`` before its first word -- and ends ``trail_ms`` after its
+        last, so the snippet *is* the hotword.  Without them it falls back to
+        the fixed window: everything retained up to ``pre_roll_ms``, then
+        ``post_roll_ms`` more as it arrives.
+
+        Either way the audio already buffered is written now and the remainder
+        is streamed by :meth:`_write_snippet`, so a phrase whose trailing pad
+        has not been captured yet still gets it.
 
         Args:
             found: The phrase that opened the snippet.
             text: The full recognised text.
+            recognition: The result the phrase came from.
         """
         os.makedirs(self._config.snippet_dir, exist_ok=True)
         seq = self._next_seq
@@ -617,15 +741,46 @@ class VoiceGateSink:
         self._snippet_phrase = found.phrase
         self._snippet_text = text
         self._snippet_truncated = False
-        self._post_roll_left = self._post_roll_frames
         # A snippet is open, so the cooldown clock is not running.
         self._frames_since_snippet = None
 
-        written = writer.write(self._pre_roll.snapshot())
-        # The pre-roll ends at the last frame consumed, so the file starts that
-        # far back.  With no pre-roll configured this is simply "now", and the
-        # snippet begins with the audio that follows the match.
-        self._snippet_start_frame = max(0, (self._next_expected or 0) - written)
+        current = self._next_expected or 0
+        located = self._locate_phrase(found, recognition)
+
+        if located is not None:
+            start_frame, end_frame = located
+            available_end = min(end_frame, current)
+            byte_start = self._pre_roll.appended - (current - start_frame) * _BYTES_PER_FRAME
+            byte_end = self._pre_roll.appended - (current - available_end) * _BYTES_PER_FRAME
+            audio = self._pre_roll.extract(byte_start, byte_end)
+            if audio is not None:
+                with self._lock:
+                    self._clips_located += 1
+                self._snippet_start_frame = start_frame
+                written = writer.write(audio)
+                # Whatever of the trailing pad has not been captured yet.
+                self._post_roll_left = max(0, end_frame - available_end)
+                if self._post_roll_left == 0:
+                    self._close_snippet(truncated=False)
+                else:
+                    self._check_snippet_limits()
+                return
+            # extract() refused the range, so the phrase is not fully retained
+            # after all; fall through rather than write a clipped hotword.
+
+        with self._lock:
+            self._clips_fallback += 1
+        self._post_roll_left = self._post_roll_frames
+        # The window path keeps only the configured pre-roll, not the whole
+        # lookback the buffer now holds for locating.
+        pre_roll_bytes = (
+            self._config.pre_roll_frames(self._sample_rate) * _BYTES_PER_FRAME
+        )
+        snapshot = self._pre_roll.snapshot()
+        if len(snapshot) > pre_roll_bytes:
+            snapshot = snapshot[len(snapshot) - pre_roll_bytes :]
+        written = writer.write(snapshot)
+        self._snippet_start_frame = max(0, current - written)
         self._check_snippet_limits()
 
     def _write_snippet(self, pcm: bytes, frames: int) -> None:

@@ -69,7 +69,7 @@ class PreRollBuffer:
     chunk to protect against a caller that does not exist.
     """
 
-    __slots__ = ("_capacity_bytes", "_chunks", "_size")
+    __slots__ = ("_capacity_bytes", "_chunks", "_size", "_appended")
 
     def __init__(self, capacity_bytes: int) -> None:
         """Create an empty buffer holding at most ``capacity_bytes``.
@@ -90,6 +90,7 @@ class PreRollBuffer:
         self._capacity_bytes: int = capacity_bytes
         self._chunks: collections.deque[bytes] = collections.deque()
         self._size: int = 0
+        self._appended: int = 0
 
     @property
     def capacity_bytes(self) -> int:
@@ -100,6 +101,62 @@ class PreRollBuffer:
     def size(self) -> int:
         """Bytes currently buffered; never above :attr:`capacity_bytes`."""
         return self._size
+
+    @property
+    def appended(self) -> int:
+        """Total bytes ever appended, including those since evicted.
+
+        This is the buffer's clock.  It gives every byte a stable position in
+        the stream, so a caller holding an absolute offset can ask for a range
+        that is still retained -- which is what
+        :meth:`extract` needs and what the running :attr:`size` alone could not
+        express.  Reset by :meth:`clear`, because after a discontinuity the
+        offsets on either side do not describe one continuous stream.
+        """
+        return self._appended
+
+    @property
+    def oldest(self) -> int:
+        """Stream offset of the oldest retained byte, in :attr:`appended` terms."""
+        return self._appended - self._size
+
+    def extract(self, start: int, end: int) -> bytes | None:
+        """Return the bytes spanning ``[start, end)`` of the appended stream.
+
+        Args:
+            start: Offset of the first byte wanted, counted the same way
+                :attr:`appended` counts.
+            end: Offset one past the last byte wanted.
+
+        Returns:
+            The requested bytes, or ``None`` if any part of the range has been
+            evicted or has not arrived yet.  **Partial ranges are refused
+            rather than clipped**: a caller asking for a wake phrase wants the
+            whole phrase, and silently returning the half that survived would
+            produce a snippet that sounds like a different word.
+        """
+        if end <= start:
+            return None
+        if start < self.oldest or end > self._appended:
+            return None
+
+        # Walk the chunks, skipping whole ones that end before `start`.
+        wanted = end - start
+        cursor = self.oldest
+        parts: list[bytes] = []
+        for chunk in self._chunks:
+            chunk_end = cursor + len(chunk)
+            if chunk_end > start:
+                lo = max(0, start - cursor)
+                hi = min(len(chunk), end - cursor)
+                parts.append(chunk[lo:hi])
+                wanted -= hi - lo
+                if wanted <= 0:
+                    break
+            cursor = chunk_end
+        if wanted > 0:  # pragma: no cover - bounds above already guarantee this
+            return None
+        return b"".join(parts)
 
     def append(self, pcm: bytes) -> None:
         """Add ``pcm`` to the back, evicting from the front to stay in bounds.
@@ -113,7 +170,10 @@ class PreRollBuffer:
         Args:
             pcm: Raw sample bytes to append.  Empty is a no-op.
         """
-        if self._capacity_bytes == 0 or not pcm:
+        if not pcm:
+            return
+        self._appended += len(pcm)
+        if self._capacity_bytes == 0:
             return
 
         if len(pcm) >= self._capacity_bytes:
@@ -166,12 +226,14 @@ class PreRollBuffer:
         """
         self._chunks.clear()
         self._size = 0
+        self._appended = 0
 
     def __repr__(self) -> str:
         """Return a debugging representation of the buffer's occupancy."""
         return (
             f"{type(self).__name__}(capacity_bytes={self._capacity_bytes}, "
-            f"size={self._size}, chunks={len(self._chunks)})"
+            f"size={self._size}, chunks={len(self._chunks)}, "
+            f"appended={self._appended})"
         )
 
 

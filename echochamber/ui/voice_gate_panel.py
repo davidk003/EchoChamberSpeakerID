@@ -58,6 +58,7 @@ _ROWS: tuple[tuple[str, str], ...] = (
     ("backend", "gate_backend"),
     ("phrases detected", "gate_detected"),
     ("snippets", "gate_snippets"),
+    ("clip cut", "gate_clip"),
     ("suppressed", "gate_suppressed"),
     ("truncated", "gate_truncated"),
     ("last phrase", "gate_last_phrase"),
@@ -95,6 +96,28 @@ def format_phrases(phrases: tuple[str, ...]) -> str:
         unchanged.
     """
     return f"{PHRASE_SEPARATOR} ".join(phrases)
+
+
+def _clip_text(stats: UiStats) -> str:
+    """Render how the snippets were cut.
+
+    Args:
+        stats: The current snapshot.
+
+    Returns:
+        ``"—"`` before the first snippet, ``"on phrase"`` when every clip was
+        located from word timings, ``"window (3)"`` when some fell back.  The
+        distinction is invisible everywhere else on this panel: a fallback clip
+        is a *wider* clip, not a missing one, so the snippet count climbs and
+        the file plays regardless -- it simply is not the hotword.
+    """
+    if not (stats.gate_located or stats.gate_fallback):
+        return "—"
+    if not stats.gate_fallback:
+        return "on phrase"
+    if not stats.gate_located:
+        return f"window ({stats.gate_fallback:,})"
+    return f"mixed ({stats.gate_fallback:,} window)"
 
 
 def _notify_state_text(stats: UiStats) -> str:
@@ -279,6 +302,7 @@ class VoiceGatePanel(QWidget):
             "gate_truncated": f"{stats.gate_truncated:,}",
             # An em dash rather than an empty cell: a blank next to a label
             # reads as a rendering failure, not as "nothing yet".
+            "gate_clip": _clip_text(stats),
             "gate_last_phrase": stats.gate_last_phrase or "—",
             "notify_state": _notify_state_text(stats),
             "notify_sent": _notify_sent_text(stats),
@@ -288,6 +312,13 @@ class VoiceGatePanel(QWidget):
 
         self._values["gate_snippets"].setStyleSheet(
             _HIT_STYLE if stats.gate_snippets else ""
+        )
+        # A clip that fell back is a *wide* clip, not a missing one, so nothing
+        # else on this panel would reveal it -- the snippet count still climbs
+        # and the file still plays. Only this row says the audio is not the
+        # hotword it claims to be.
+        self._values["gate_clip"].setStyleSheet(
+            _WARN_STYLE if stats.gate_fallback else ""
         )
         # A notifier that is on but disconnected, or dropping events, is the
         # failure this row exists to make visible: events are being generated

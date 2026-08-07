@@ -71,7 +71,7 @@ from echochamber.voicegate.protocol import (
     read_frame,
     write_frame,
 )
-from echochamber.voicegate.recognizer import Recognition
+from echochamber.voicegate.recognizer import Recognition, parse_word_timings
 
 __all__ = [
     "STDERR_LINES",
@@ -679,6 +679,10 @@ def _decode_result(payload: bytes) -> Recognition:
         text=text,
         final=bool(parsed.get("final", False)),
         confidence=float(confidence),
+        # Reuses the same coercion the in-process backend applies to Vosk's own
+        # JSON, so a malformed timing degrades to "no timings" -- and therefore
+        # to a wider clip -- rather than to a confidently wrong one.
+        words=parse_word_timings(parsed.get("words")),
     )
 
 

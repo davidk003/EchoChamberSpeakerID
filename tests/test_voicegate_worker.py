@@ -38,7 +38,11 @@ from echochamber.voicegate.protocol import (
     encode_json,
     read_frame,
 )
-from echochamber.voicegate.recognizer import Recognition, ScriptedRecognizer
+from echochamber.voicegate.recognizer import (
+    Recognition,
+    ScriptedRecognizer,
+    WordTiming,
+)
 
 
 MODEL = "/models/vosk-model-small-en-us-0.15"
@@ -317,8 +321,13 @@ class TestRunHappyPath:
         frames = outbound(stdout)
         assert kinds(frames) == [FrameKind.READY, FrameKind.RESULT, FrameKind.RESULT]
         assert [decode_json(p) for _, p in frames[1:]] == [
-            {"text": "hey chamber", "final": True, "confidence": 0.0},
-            {"text": "start recording", "final": True, "confidence": 0.0},
+            {"text": "hey chamber", "final": True, "confidence": 0.0, "words": []},
+            {
+                "text": "start recording",
+                "final": True,
+                "confidence": 0.0,
+                "words": [],
+            },
         ]
 
     def test_the_recognizer_receives_the_audio_payloads(
@@ -362,7 +371,7 @@ class TestRunHappyPath:
         worker.run(inbound(audio(4), FrameKind.SHUTDOWN), stdout, MODEL, SR)
 
         assert decode_json(outbound(stdout)[1][1]) == {
-            "text": "hey cham", "final": False, "confidence": 0.0
+            "text": "hey cham", "final": False, "confidence": 0.0, "words": []
         }
 
     def test_confidence_is_serialised_as_a_float(
@@ -694,12 +703,31 @@ class _FakeStdio:
 class TestEncodeResult:
     """The RESULT payload is what the parent's _decode_result reads back."""
 
-    def test_encodes_the_three_documented_fields(self) -> None:
-        """text/final/confidence, and nothing else the parent must guess at."""
+    def test_encodes_the_four_documented_fields(self) -> None:
+        """text/final/confidence/words, and nothing the parent must guess at."""
         payload = worker._encode_result(Recognition("hey chamber", True, 0.5))
         assert json.loads(payload.decode("utf-8")) == {
-            "text": "hey chamber", "final": True, "confidence": 0.5
+            "text": "hey chamber", "final": True, "confidence": 0.5, "words": []
         }
+
+    def test_forwards_word_timings(self) -> None:
+        """Timings must cross the pipe: the parent cannot load Vosk to get them.
+
+        On the ARM64 target this process is the only one that can see word
+        timings at all, so dropping them here would leave that build cutting
+        wide fallback clips while x86-64 cut precisely -- a difference nobody
+        would notice until they listened to the shipped machine's files.
+        """
+        result = Recognition(
+            "ok google",
+            final=True,
+            words=(WordTiming("ok", 2.0, 2.25, 0.9), WordTiming("google", 2.25, 2.6, 0.5)),
+        )
+        parsed = json.loads(worker._encode_result(result).decode("utf-8"))
+        assert parsed["words"] == [
+            {"word": "ok", "start": 2.0, "end": 2.25, "conf": 0.9},
+            {"word": "google", "start": 2.25, "end": 2.6, "conf": 0.5},
+        ]
 
     def test_coerces_final_to_a_bool_and_confidence_to_a_float(self) -> None:
         """JSON has no numpy types; coercion happens before serialisation."""
@@ -711,5 +739,6 @@ class TestEncodeResult:
     def test_round_trips_through_encode_json(self) -> None:
         """The payload is valid JSON the protocol helpers can decode."""
         payload = worker._encode_result(Recognition("", False, 0.0))
-        assert decode_json(payload) == {"text": "", "final": False, "confidence": 0.0}
-        assert payload == encode_json({"text": "", "final": False, "confidence": 0.0})
+        expected = {"text": "", "final": False, "confidence": 0.0, "words": []}
+        assert decode_json(payload) == expected
+        assert payload == encode_json(expected)

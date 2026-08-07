@@ -683,7 +683,10 @@ class TestEndToEnd:
         assert payloads[1]["frames"] == 24_000
         assert payloads[1]["duration_s"] == pytest.approx(1.5)
         assert payloads[1]["truncated"] is False
-        assert "audio" not in payloads[1], "include_audio is off by default"
+        # include_audio defaults on: sending the clip that triggered the gate
+        # is the point of the gate.
+        assert payloads[1]["audio"]["format"] == "wav"
+        assert payloads[1]["audio"]["bytes"] > 0
 
         assert notifier.snapshot().dropped == 0
         assert notifier.snapshot().failed == 0

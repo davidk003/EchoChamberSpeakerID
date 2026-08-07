@@ -31,9 +31,15 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
-__all__ = ["PhraseMatch", "match_phrase", "normalize", "tokenize"]
+__all__ = [
+    "PhraseMatch",
+    "locate_phrase",
+    "match_phrase",
+    "normalize",
+    "tokenize",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +142,57 @@ def find_tokens(haystack: Sequence[str], needle: Sequence[str]) -> int:
         if tuple(haystack[start : start + n_needle]) == tuple(needle):
             return start
     return -1
+
+
+def locate_phrase(
+    match: PhraseMatch, words: Sequence[Any]
+) -> tuple[float, float] | None:
+    """Return the seconds spanned by the matched phrase, if they can be trusted.
+
+    :attr:`PhraseMatch.token_index` indexes the *normalised tokens* of the
+    recognised text, while ``words`` comes from the decoder.  Those two line up
+    only if normalisation did not change the word count -- which it does not for
+    the small English model, whose output is already lowercase and unpunctuated.
+    But "does not, in practice, for this model" is not a guarantee, and a
+    mis-indexed lookup would silently cut a snippet from the wrong audio.
+
+    So the alignment is **checked rather than assumed**: the word the timing
+    claims must be the token that matched.  A mismatch returns ``None``, which
+    the caller reads as "locate this the old way".
+
+    Args:
+        match: The phrase found by :func:`match_phrase`.
+        words: Per-word timings from the recogniser, each exposing ``word``,
+            ``start`` and ``end``.  Typed loosely to keep this module free of an
+            import from :mod:`echochamber.voicegate.recognizer`, which would be
+            circular.
+
+    Returns:
+        ``(start_s, end_s)`` covering every word of the phrase, or ``None`` when
+        there are no timings, the index does not fit, or the words at that index
+        are not the phrase.
+    """
+    needle = match.phrase.split()
+    if not needle or not words:
+        return None
+
+    start_index = match.token_index
+    end_index = start_index + len(needle)
+    if start_index < 0 or end_index > len(words):
+        return None
+
+    span = list(words[start_index:end_index])
+    for timing, expected in zip(span, needle):
+        # Normalise the decoder's word the same way the haystack was, so the
+        # comparison is like for like rather than raw-against-folded.
+        if normalize(getattr(timing, "word", "")) != expected:
+            return None
+
+    start = float(getattr(span[0], "start", 0.0))
+    end = float(getattr(span[-1], "end", 0.0))
+    if end < start:
+        return None
+    return start, end
 
 
 def match_phrase(text: str, phrases: Iterable[str]) -> PhraseMatch | None:

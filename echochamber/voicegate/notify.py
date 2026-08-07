@@ -106,10 +106,13 @@ class NotifyConfig:
         url: WebSocket endpoint, ``ws://`` or ``wss://``.
         events: Which :class:`EventKind` values to send.  Both by default.
         include_audio: Whether a ``SNIPPET`` event carries the WAV file's bytes,
-            base64-encoded.  Off by default -- a 4.5 s snippet is roughly 190 KB
-            of PCM, which becomes ~250 KB of base64 on every event, and a
-            consumer that only wants to know *that* a phrase was heard should
-            not pay for that.
+            base64-encoded.  **On by default**, because sending the audio that
+            triggered the gate is the point of the gate.  Under
+            :attr:`~echochamber.voicegate.config.ClipMode.PHRASE` a clip is the
+            hotword and little else -- around a second, ~32 KB, ~43 KB once
+            base64'd -- so this is cheap.  Turn it off for a consumer that only
+            wants to know *that* a phrase was heard, or when clips are being
+            collected from the ``path`` instead.
         max_audio_bytes: Ceiling on an included snippet.  A file above it is
             sent **without** audio rather than truncated: half a WAV under a
             header claiming the full length is indistinguishable from a
@@ -133,7 +136,7 @@ class NotifyConfig:
     enabled: bool = False
     url: str = DEFAULT_URL
     events: frozenset[EventKind] = frozenset(EventKind)
-    include_audio: bool = False
+    include_audio: bool = True
     max_audio_bytes: int = 4 * 1024 * 1024
     queue_max: int = 32
     connect_timeout_s: float = 5.0

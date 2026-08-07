@@ -294,9 +294,9 @@ class TestNotifyConfigDefaults:
         """Detection and snippet answer different questions; default to both."""
         assert NotifyConfig().events == frozenset(EventKind)
 
-    def test_audio_is_excluded_by_default(self) -> None:
-        """A consumer that only wants to know *that* a phrase was heard pays nothing."""
-        assert NotifyConfig().include_audio is False
+    def test_audio_is_included_by_default(self) -> None:
+        """Sending the clip that triggered the gate is the point of the gate."""
+        assert NotifyConfig().include_audio is True
 
     def test_a_disabled_config_is_not_validated_against_its_url(self) -> None:
         """Only an enabled config has to name somewhere reachable."""
