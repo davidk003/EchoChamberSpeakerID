@@ -292,7 +292,8 @@ class NotifyStats:
     Frozen and returned by :meth:`WebSocketNotifier.snapshot` for the same
     reason :meth:`echochamber.voicegate.sink.VoiceGateSink.snapshot` is: the GUI
     polls while the sender thread updates, and reading fields one at a time
-    would let a display mix two instants.
+    would let a display mix two instants.  See that method for the one field
+    -- :attr:`queued` -- that is sampled separately, and why.
 
     Attributes:
         queued: Events waiting to be sent.
@@ -568,8 +569,13 @@ class WebSocketNotifier:
         """Return a detached copy of every counter.
 
         Returns:
-            The counters as of this moment, taken under one lock acquisition so
-            the fields agree with each other.
+            The counters as of this moment.  The send counters agree with each
+            other, being read under one lock; ``queued`` comes from the queue's
+            own condition and so is sampled a moment earlier.  That seam is
+            deliberate -- taking both locks together would order them against
+            the sender thread, which holds the condition while it waits -- and
+            it is harmless, because ``queued`` describes a backlog that is
+            changing anyway and no consumer derives one field from another.
         """
         queued = self.queued
         with self._lock:
