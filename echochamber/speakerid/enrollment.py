@@ -10,10 +10,22 @@ from __future__ import annotations
 
 import json
 import os
+import wave
 
 import numpy as np
 
-__all__ = ["BACKEND_QNN", "clear_db", "enroll", "load_db", "remove_speaker", "save_db"]
+__all__ = [
+    "BACKEND_QNN",
+    "clear_db",
+    "enroll",
+    "load_db",
+    "load_wav_mono",
+    "remove_speaker",
+    "save_db",
+]
+
+_SUPPORTED_WIDTHS: tuple[int, ...] = (1, 2, 4)
+"""Sample widths in bytes :func:`load_wav_mono` can decode: 8-, 16- and 32-bit PCM."""
 
 BACKEND_QNN: str = "qnn"
 """The only enrollment ``backend`` tag this project writes or reads.
@@ -86,6 +98,64 @@ def remove_speaker(db: dict, name: str) -> bool:
         ``True`` if an entry was removed, ``False`` if ``name`` was not enrolled.
     """
     return db.pop(name, None) is not None
+
+
+def load_wav_mono(path: str) -> tuple[np.ndarray, int]:
+    """Read an entire WAV file as mono ``float32`` samples in ``[-1, 1]``.
+
+    The primary way to enroll a speaker: a clip recorded once, elsewhere,
+    with whatever microphone and editing tooling someone already has, rather
+    than requiring them to sit in front of *this* app's own microphone
+    picker. Decodes the same way
+    :class:`~echochamber.audio.sources.file_source.FileSource` does -- any
+    sample rate, any of the three PCM widths it understands, multi-channel
+    downmixed by averaging -- so a snippet this app wrote, or a clip from
+    any other recorder, both just work.
+
+    Args:
+        path: Path to an uncompressed PCM WAV file.
+
+    Returns:
+        ``(samples, sample_rate)``. ``sample_rate`` is whatever the file's
+        header says; the embedder resamples internally, so nothing here
+        needs to match its expected rate.
+
+    Raises:
+        ValueError: If the file is not readable PCM, or its sample width is
+            not 8-, 16- or 32-bit.
+        OSError: If the file cannot be opened.
+    """
+    try:
+        with wave.open(path, "rb") as wav:
+            params = wav.getparams()
+            if params.comptype != "NONE":
+                raise ValueError(
+                    f"{path!r} uses compression {params.comptype!r} "
+                    f"({params.compname!r}); only uncompressed PCM is supported"
+                )
+            if params.sampwidth not in _SUPPORTED_WIDTHS:
+                raise ValueError(
+                    f"{path!r} has sample width {params.sampwidth * 8} bits; "
+                    f"only 8-, 16- and 32-bit PCM are supported"
+                )
+            raw = wav.readframes(params.nframes)
+    except wave.Error as exc:
+        raise ValueError(
+            f"{path!r} is not a readable uncompressed PCM WAV file: {exc}"
+        ) from exc
+
+    if params.sampwidth == 1:
+        # 8-bit WAV is *unsigned*, biased by 128 -- the one format that is
+        # not a straight signed integer.
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif params.sampwidth == 2:
+        data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    else:
+        data = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+
+    if params.nchannels > 1:
+        data = data.reshape(-1, params.nchannels).mean(axis=1)
+    return data.astype(np.float32), params.framerate
 
 
 def clear_db(path: str) -> None:

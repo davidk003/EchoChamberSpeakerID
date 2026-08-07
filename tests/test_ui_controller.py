@@ -1198,3 +1198,48 @@ def test_poll_interval_is_the_specified_30hz() -> None:
         assert controller.poll_timer.interval() == POLL_INTERVAL_MS
     finally:
         controller.stop()
+
+
+# -- ADB hotword trigger wiring ---------------------------------------------
+
+
+def test_adb_trigger_is_disabled_by_default(
+    make_controller: Callable[..., CaptureController]
+) -> None:
+    controller = make_controller()
+    assert controller.adb_trigger_config.enabled is False
+    assert controller.adb_trigger is None
+
+
+def test_set_adb_trigger_enabled_flips_the_config(
+    make_controller: Callable[..., CaptureController]
+) -> None:
+    controller = make_controller()
+    assert controller.set_adb_trigger_enabled(True) is True
+    assert controller.adb_trigger_config.enabled is True
+    assert controller.set_adb_trigger_enabled(False) is True
+    assert controller.adb_trigger_config.enabled is False
+
+
+def test_ui_stats_carries_adb_trigger_fields() -> None:
+    names = {f.name for f in dataclasses.fields(UiStats)}
+    required = {
+        "adb_trigger_backend",
+        "adb_trigger_enabled",
+        "adb_trigger_blocked",
+        "adb_trigger_block_count",
+        "adb_trigger_unblock_count",
+        "adb_trigger_error",
+    }
+    missing = required - names
+    assert not missing, f"UiStats is missing adb trigger fields: {sorted(missing)}"
+
+
+def test_stopped_controller_reports_adb_trigger_off_in_stats(
+    make_controller: Callable[..., CaptureController]
+) -> None:
+    controller = make_controller()
+    stats = controller.poll()
+    assert stats.adb_trigger_backend == "none"
+    assert stats.adb_trigger_enabled is False
+    assert stats.adb_trigger_blocked is False

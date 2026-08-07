@@ -1,15 +1,20 @@
 """Enroll, list, and remove speakers for the QNN speaker-verification backend.
 
-Records a clip from the default microphone, embeds it via the QNN subprocess
-chain (:mod:`echochamber.speakerid.qnn_subprocess`), and stores the result in
-the enrollment database
-(:mod:`echochamber.speakerid.enrollment`) -- this repository's own
-``enrolled_speakers.json``, independent of the sibling ``cam-script``
-repository's file of the same name.
+Embeds a clip via the QNN subprocess chain
+(:mod:`echochamber.speakerid.qnn_subprocess`) and stores the result in the
+enrollment database (:mod:`echochamber.speakerid.enrollment`) -- this
+repository's own ``enrolled_speakers.json``, independent of the sibling
+``cam-script`` repository's file of the same name.
+
+The clip can come from **an existing WAV file** (``--wav``, the primary way
+-- record it however you like, on any device, ahead of time) or, if none is
+given, from **a live recording** off the default microphone (the fallback,
+for when there is nothing to point at yet).
 
 Usage::
 
-    python scripts/enroll_speaker.py enroll alice --seconds 5
+    python scripts/enroll_speaker.py enroll alice --wav alice_sample.wav
+    python scripts/enroll_speaker.py enroll alice --seconds 5   # live mic instead
     python scripts/enroll_speaker.py list
     python scripts/enroll_speaker.py remove alice
     python scripts/enroll_speaker.py clear
@@ -35,6 +40,7 @@ from echochamber.speakerid.enrollment import (  # noqa: E402
     clear_db,
     enroll,
     load_db,
+    load_wav_mono,
     remove_speaker,
     save_db,
 )
@@ -89,12 +95,16 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         )
         return 1
 
-    samples = _record(args.seconds)
+    if args.wav is not None:
+        print(f"Reading {args.wav!r} ...")
+        samples, sample_rate = load_wav_mono(args.wav)
+    else:
+        samples, sample_rate = _record(args.seconds), _SAMPLE_RATE
 
     print("Embedding via the QNN subprocess chain (this can take a while on first run)...")
     embedder = build_embedder(config)
     try:
-        embedding = embedder.embed(samples, _SAMPLE_RATE)
+        embedding = embedder.embed(samples, sample_rate)
     finally:
         embedder.close()
 
@@ -145,9 +155,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--npu-python", default=None, help="native ARM64 NPU-worker interpreter (default: driver's own default)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    pe = sub.add_parser("enroll", help="enroll a speaker from a mic recording")
+    pe = sub.add_parser("enroll", help="enroll a speaker from a WAV file or a mic recording")
     pe.add_argument("name")
-    pe.add_argument("--seconds", type=float, default=5.0)
+    pe.add_argument(
+        "--wav",
+        default=None,
+        help="WAV file to enroll from (primary option; skips the mic entirely)",
+    )
+    pe.add_argument(
+        "--seconds",
+        type=float,
+        default=5.0,
+        help="length of the live mic recording, used only when --wav is not given",
+    )
     pe.set_defaults(func=cmd_enroll)
 
     pl = sub.add_parser("list", help="list enrolled speakers")

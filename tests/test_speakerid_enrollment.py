@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import wave
 from typing import Any
 
 import numpy as np
@@ -18,9 +19,31 @@ from echochamber.speakerid.enrollment import (
     clear_db,
     enroll,
     load_db,
+    load_wav_mono,
     remove_speaker,
     save_db,
 )
+
+
+def _write_wav(
+    path: str,
+    samples: np.ndarray,
+    sample_rate: int = 16_000,
+    channels: int = 1,
+    sampwidth: int = 2,
+) -> None:
+    """Write ``samples`` (float32, ``[-1, 1]``, interleaved) as a PCM WAV file."""
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(sampwidth)
+        wav.setframerate(sample_rate)
+        if sampwidth == 2:
+            data = (samples * 32767.0).astype("<i2")
+        elif sampwidth == 1:
+            data = ((samples * 127.0) + 128.0).astype(np.uint8)
+        else:
+            data = (samples * 2147483647.0).astype("<i4")
+        wav.writeframes(data.tobytes())
 
 
 class TestLoadDb:
@@ -103,3 +126,39 @@ class TestClearDb:
 
     def test_missing_file_is_not_an_error(self, tmp_path: Any) -> None:
         clear_db(str(tmp_path / "missing.json"))  # must not raise
+
+
+class TestLoadWavMono:
+    def test_reads_mono_16bit_pcm(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "clip.wav")
+        samples = np.array([0.0, 0.5, -0.5, 0.25], dtype=np.float32)
+        _write_wav(path, samples, sample_rate=16_000, channels=1, sampwidth=2)
+
+        loaded, sample_rate = load_wav_mono(path)
+
+        assert sample_rate == 16_000
+        assert loaded.dtype == np.float32
+        assert loaded == pytest.approx(samples, abs=1e-3)
+
+    def test_downmixes_stereo_by_averaging(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "stereo.wav")
+        left = np.array([1.0, -1.0], dtype=np.float32)
+        right = np.array([0.0, 0.0], dtype=np.float32)
+        interleaved = np.empty(4, dtype=np.float32)
+        interleaved[0::2] = left
+        interleaved[1::2] = right
+        _write_wav(path, interleaved, channels=2, sampwidth=2)
+
+        loaded, _ = load_wav_mono(path)
+
+        assert loaded == pytest.approx([0.5, -0.5], abs=1e-3)
+
+    def test_reports_the_files_own_sample_rate(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "clip.wav")
+        _write_wav(path, np.zeros(10, dtype=np.float32), sample_rate=44_100)
+        _, sample_rate = load_wav_mono(path)
+        assert sample_rate == 44_100
+
+    def test_rejects_a_missing_file(self, tmp_path: Any) -> None:
+        with pytest.raises(OSError):
+            load_wav_mono(str(tmp_path / "missing.wav"))

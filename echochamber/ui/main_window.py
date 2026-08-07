@@ -29,6 +29,7 @@ from echochamber.ui.controller import CaptureController, CaptureState, UiStats
 from echochamber.ui.device_panel import DevicePanel
 from echochamber.ui.geometry_panel import GeometryPanel
 from echochamber.ui.meters import LevelMeter
+from echochamber.ui.speaker_panel import SpeakerPanel
 from echochamber.ui.stats_panel import StatsPanel
 from echochamber.ui.voice_gate_panel import VoiceGatePanel
 
@@ -65,6 +66,7 @@ class MainWindow(QMainWindow):
         self.geometry_panel: GeometryPanel = GeometryPanel(self)
         self.stats_panel: StatsPanel = StatsPanel(self)
         self.voice_gate_panel: VoiceGatePanel = VoiceGatePanel(self)
+        self.speaker_panel: SpeakerPanel = SpeakerPanel(self)
         self.level_meter: LevelMeter = LevelMeter(self)
 
         meter_box = QGroupBox("Level", self)
@@ -82,6 +84,7 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout()
         right.addWidget(self.stats_panel)
         right.addWidget(self.voice_gate_panel)
+        right.addWidget(self.speaker_panel)
         right.addStretch(1)
 
         central = QWidget(self)
@@ -109,6 +112,12 @@ class MainWindow(QMainWindow):
         self.geometry_panel.geometry_changed.connect(self._on_geometry_changed)
         self.voice_gate_panel.enabled_changed.connect(self._on_gate_enabled_changed)
         self.voice_gate_panel.phrases_changed.connect(self._on_gate_phrases_changed)
+        self.speaker_panel.speaker_id_enabled_changed.connect(
+            self._on_speaker_id_enabled_changed
+        )
+        self.speaker_panel.adb_trigger_enabled_changed.connect(
+            self._on_adb_trigger_enabled_changed
+        )
 
         self._controller.stats_updated.connect(self._on_stats_updated)
         self._controller.state_changed.connect(self._on_state_changed)
@@ -122,6 +131,11 @@ class MainWindow(QMainWindow):
         gate = self._controller.voice_gate_config
         self.voice_gate_panel.set_config(gate.enabled, gate.phrases)
         self.voice_gate_panel.set_editable(
+            self._controller.state is not CaptureState.RUNNING
+        )
+        self.speaker_panel.set_speaker_config(self._controller.speaker_id_config)
+        self.speaker_panel.set_adb_enabled(self._controller.adb_trigger_config.enabled)
+        self.speaker_panel.set_editable(
             self._controller.state is not CaptureState.RUNNING
         )
         self.device_panel.set_state(self._controller.state)
@@ -201,6 +215,28 @@ class MainWindow(QMainWindow):
             gate = self._controller.voice_gate_config
             self.voice_gate_panel.set_config(gate.enabled, gate.phrases)
 
+    def _on_speaker_id_enabled_changed(self, enabled: bool) -> None:
+        """Switch speaker verification on or off for the next run.
+
+        Args:
+            enabled: Whether the user ticked the box.
+        """
+        self._controller.set_speaker_id_enabled(enabled)
+        self.speaker_panel.set_note(
+            "takes effect on the next start" if enabled else ""
+        )
+
+    def _on_adb_trigger_enabled_changed(self, enabled: bool) -> None:
+        """Switch the ADB hotword trigger on or off for the next run.
+
+        Args:
+            enabled: Whether the user ticked the box.
+        """
+        self._controller.set_adb_trigger_enabled(enabled)
+        self.speaker_panel.set_note(
+            "takes effect on the next start" if enabled else ""
+        )
+
     # -- controller state --------------------------------------------------
 
     def _on_stats_updated(self, stats: UiStats) -> None:
@@ -211,6 +247,7 @@ class MainWindow(QMainWindow):
         """
         self.stats_panel.update_stats(stats)
         self.voice_gate_panel.update_stats(stats)
+        self.speaker_panel.update_stats(stats)
         self.level_meter.set_levels(stats.rms_level, stats.display_peak)
         self.level_text.setText(
             f"rms {stats.rms_level:.3f}   peak {stats.display_peak:.3f}"
@@ -226,6 +263,7 @@ class MainWindow(QMainWindow):
         # The recogniser is built once per run, so gate settings cannot be
         # edited into a running capture; see VoiceGatePanel's module docstring.
         self.voice_gate_panel.set_editable(state is not CaptureState.RUNNING)
+        self.speaker_panel.set_editable(state is not CaptureState.RUNNING)
 
     def _on_devices_changed(self, devices: list[DeviceInfo]) -> None:
         """Repopulate the device picker.

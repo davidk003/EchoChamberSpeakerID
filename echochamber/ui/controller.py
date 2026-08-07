@@ -44,7 +44,12 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from echochamber.adb.config import AdbTriggerConfig, autodetect_adb_trigger_config
-from echochamber.adb.trigger import AdbHotwordTrigger, AdbTriggerChoice, build_adb_trigger
+from echochamber.adb.trigger import (
+    AdbHotwordTrigger,
+    AdbTriggerChoice,
+    AdbTriggerStats,
+    build_adb_trigger,
+)
 from echochamber.adb.trigger import describe_backend as describe_adb_backend
 from echochamber.audio.devices import DeviceInfo, list_input_devices
 from echochamber.audio.latency import LatencySummary, LatencyTracker
@@ -197,6 +202,15 @@ class UiStats:
             ``"adb"`` or ``"none"``.  ``"none"`` while the trigger is
             configured on means it failed to start -- mirrors
             ``gate_backend``'s own contract.
+        adb_trigger_enabled: Whether the trigger is switched on for the next
+            run.  Independent of whether it actually started -- see
+            ``adb_trigger_backend`` for that.
+        adb_trigger_blocked: The trigger's current believed state of the
+            device hotword permission -- ``True`` while it last revoked it
+            (an unverified voice was heard), ``False`` otherwise.
+        adb_trigger_block_count: Successful blocks issued this run.
+        adb_trigger_unblock_count: Successful unblocks issued this run.
+        adb_trigger_error: The trigger's most recent failure, or ``None``.
     """
 
     state: CaptureState
@@ -238,6 +252,11 @@ class UiStats:
     notify_queued: int = 0
     notify_error: str | None = None
     adb_trigger_backend: str = "none"
+    adb_trigger_enabled: bool = False
+    adb_trigger_blocked: bool = False
+    adb_trigger_block_count: int = 0
+    adb_trigger_unblock_count: int = 0
+    adb_trigger_error: str | None = None
 
 
 class LatestChunkSink:
@@ -572,6 +591,7 @@ class CaptureController(QObject):
         # exactly when you want to read what the gate caught.
         self._gate_stats: VoiceGateStats = VoiceGateStats()
         self._notify_stats: NotifyStats = NotifyStats()
+        self._adb_trigger_stats: AdbTriggerStats = AdbTriggerStats()
 
         self._state: CaptureState = CaptureState.STOPPED
         self._devices: list[DeviceInfo] = []
@@ -669,6 +689,16 @@ class CaptureController(QObject):
     def speaker_id_config(self) -> SpeakerIdConfig:
         """The speaker-verification configuration the next :meth:`start` will use."""
         return self._speaker_id_config
+
+    @property
+    def adb_trigger_config(self) -> AdbTriggerConfig:
+        """The ADB hotword-trigger configuration the next :meth:`start` will use."""
+        return self._adb_trigger_config
+
+    @property
+    def adb_trigger(self) -> AdbHotwordTrigger | None:
+        """The live ADB hotword trigger, or ``None`` when stopped or off."""
+        return self._adb_trigger
 
     @property
     def poll_timer(self) -> QTimer:
@@ -802,6 +832,7 @@ class CaptureController(QObject):
         self._gate_sink = gate_sink
         self._gate_stats = VoiceGateStats()
         self._notify_stats = NotifyStats()
+        self._adb_trigger_stats = AdbTriggerStats()
         self._peak_hold.reset()
         self._last_snapshot = StreamStats()
         self._latency_ms = 0.0
@@ -854,6 +885,8 @@ class CaptureController(QObject):
         # Sampled before the notifier is closed, since closing drops whatever is
         # still queued and zeroes `connected`.
         self._sample_notifier()
+        # Sampled before the trigger is closed, for the same reason.
+        self._sample_adb_trigger()
         gate_sink = self._gate_sink
         if gate_sink is not None:
             # AudioPipeline.stop already closed the tee, and close is
@@ -1012,6 +1045,24 @@ class CaptureController(QObject):
         self._speaker_id_config = self._speaker_id_config.with_enabled(enabled)
         return True
 
+    def set_adb_trigger_enabled(self, enabled: bool) -> bool:
+        """Switch the ADB hotword trigger on or off for the next run.
+
+        Only takes effect while the wake-phrase gate is also enabled: see
+        :meth:`_build_gate`, which is the only caller of
+        :meth:`_build_adb_trigger`. Enabling this with the gate off is not
+        rejected -- the setting is simply dormant until the gate is turned
+        on too, exactly like :meth:`set_speaker_id_enabled`.
+
+        Args:
+            enabled: Whether the trigger should run.
+
+        Returns:
+            ``True``.  Never raises.
+        """
+        self._adb_trigger_config = self._adb_trigger_config.with_enabled(enabled)
+        return True
+
     # -- the tick ----------------------------------------------------------
 
     def poll(self) -> UiStats:
@@ -1040,6 +1091,7 @@ class CaptureController(QObject):
                 pass
             self._sample_gate()
             self._sample_notifier()
+            self._sample_adb_trigger()
 
             error = _pipeline_error(pipeline)
             if error is not None and not self._error_reported:
@@ -1120,6 +1172,11 @@ class CaptureController(QObject):
             notify_queued=notify.queued,
             notify_error=notify.error,
             adb_trigger_backend=self._adb_trigger_backend,
+            adb_trigger_enabled=self._adb_trigger_config.enabled,
+            adb_trigger_blocked=self._adb_trigger_stats.blocked,
+            adb_trigger_block_count=self._adb_trigger_stats.block_count,
+            adb_trigger_unblock_count=self._adb_trigger_stats.unblock_count,
+            adb_trigger_error=self._adb_trigger_stats.last_error,
         )
 
     def _sample_notifier(self) -> None:
@@ -1129,6 +1186,16 @@ class CaptureController(QObject):
             return
         try:
             self._notify_stats = notifier.snapshot()
+        except Exception:  # noqa: BLE001 - a display tick must never raise
+            pass
+
+    def _sample_adb_trigger(self) -> None:
+        """Refresh the cached adb-trigger counters, never raising."""
+        trigger = self._adb_trigger
+        if trigger is None:
+            return
+        try:
+            self._adb_trigger_stats = trigger.snapshot()
         except Exception:  # noqa: BLE001 - a display tick must never raise
             pass
 

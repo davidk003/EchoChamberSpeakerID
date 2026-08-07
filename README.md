@@ -1,150 +1,149 @@
-# EchoChamber — Speaker ID audio ingestion
+# EchoChamber
 
-Low-latency Windows audio capture that turns a live microphone (or a WAV file) into
-**configurable overlapping windows**, ready to hand to an audio classification model.
-The ML stage is deliberately out of scope: the pipeline ends at a pluggable sink.
+**Your phone only listens for "Hey Google" when it hears *your* voice.**
 
-## Requirements
+EchoChamber watches the mic for a wake phrase, checks whether it was *you* who said it,
+and if it wasn't — blocks Google Assistant from responding at all, live, over ADB. Say it
+yourself and everything stays exactly as if EchoChamber weren't there.
 
-- Windows 10/11 (x86-64 or ARM64)
-- Python 3.11+
-- A microphone (optional — you can also feed it a WAV file)
+```
+ mic ──► "hey google"? ──► is that YOUR voice? ──► yes: do nothing
+                                    │
+                                    └── no: block "Ok Google" on your phone
+```
 
-## Quick start
+No wake word ever leaves your machine. No cloud, no API keys, nothing installed on the
+phone — just `adb` flipping a permission on and off.
+
+## Try it in 2 minutes
 
 ```bash
-# 1. Clone the repo and enter it
 git clone <this-repo-url>
 cd EchoChamberSpeakerID
-
-# 2. (Recommended) create and activate a virtual environment
 python -m venv .venv
 .venv\Scripts\activate
-
-# 3. Install dependencies
 pip install -r requirements-dev.txt
-
-# 4. Launch the GUI: pick an input device, click start, watch the meters
 python -m echochamber.app
-
-# 5. (Optional) run the test suite — no microphone needed
-pytest
 ```
 
-That's it — the app runs standalone with no extra setup. The wake-phrase
-voice gate below is an optional extra you can add later.
+Pick a microphone, hit **Start**. You're now looking at a live audio meter — that's the
+whole pipeline running with every extra feature off. Everything below is one checkbox
+away.
 
-## What it does
+## Turning on the full demo
+
+Three switches, top to bottom, each one unlocking the next:
+
+### 1. Wake-phrase detection (Vosk)
+
+```bash
+pip install .[voice-gate]              # skip this line on ARM64 -- see "Platform" below
+python scripts/setup_voice_gate.py     # downloads the model, ~50 MB, one time
+```
+
+Back in the app, tick **"Enable wake-phrase gate"** in the Voice gate panel. Restart
+capture. Say "ok google" or "hey google" out loud — you'll see it counted as a detected
+phrase and a short WAV snippet saved to `snippets/`.
+
+### 2. Enroll your voice (speaker ID)
+
+One-time model setup:
+
+```bash
+python scripts/setup_speakerid_qnn.py --skip-arm64
+.venv-speakerid-x64\Scripts\python.exe scripts\export_speakerid_qnn.py
+```
+
+Then enroll — right from the app, no terminal needed. In the new **Speaker ID & ADB
+hotword trigger** panel:
+
+- Type your name.
+- **Have a WAV file of your voice already?** Click **"Choose WAV file..."**, pick it, hit
+  **"Enroll from file"**. This is the easy, reliable way — a clean few seconds of just you
+  talking, recorded however you like.
+- **No file handy?** Use **"Record and enroll"** just below instead — it grabs a few
+  seconds straight from your microphone.
+
+Tick **"Require my voice to open a snippet"**. Restart capture. Say the wake phrase
+yourself → snippet. Have someone else say it → nothing, silently suppressed.
+
+### 3. Block the real Assistant hotword (ADB)
+
+This is the trick: when an unrecognized voice says the wake phrase, EchoChamber reaches
+out over `adb` and revokes the Google app's microphone permission — so *the phone itself*
+stops listening for "Ok Google", not just this app. Say it yourself and it's granted right
+back.
+
+What you need:
+
+- [`adb`](https://developer.android.com/tools/adb) installed and on your `PATH` (or
+  installed via Android Studio / `winget install Google.PlatformTools`).
+- An Android phone with **USB debugging** enabled (Settings → About phone → tap "Build
+  number" 7 times → Developer options → USB debugging), plugged in and authorized
+  (`adb devices` should list it as `device`, not `unauthorized`).
+
+Then just tick **"Block 'Ok Google' for anyone else"** in the same panel and restart
+capture. That's it — no app to install on the phone.
+
+> Works on stock Android with the Google app. Samsung's Bixby wake word can't be blocked
+> this way (Samsung hard-locks its mic permission) — see `echochamber/adb/hotword_core.py`
+> for the details.
+
+## What's actually happening
 
 ```
- device / WAV ──► RingBuffer ──► WindowChunker ──► bounded queue ──► consumer thread ──► sink
-                                                                                          │
-                                            GUI polls a stats snapshot at 30 Hz ──────────┘
+ mic ──► RingBuffer ──► WindowChunker ──► consumer thread ──► VoiceGateSink
+                                                                    │
+                                             phrase matched? ──► speaker verified (CAMPPlus)?
+                                                                    │
+                                                     yes ──────┬────┴──── no
+                                                       (unblock, ok)  (block via adb)
 ```
 
-- **Sample-exact windowing.** Chunk `k` covers frames `[k*H, k*H + W)`, so consecutive
-  windows share exactly `W - H` identical samples. Read positions come from a counter, never
-  a wall clock, so the grid never drifts no matter how the scheduler behaves.
-- **Configurable geometry, live.** `window_ms` and `hop_ms` change while capture runs;
-  overlap is derived rather than configured, keeping the cadence integral.
-- **The audio callback does almost nothing.** Downmix, one memcpy into a preallocated ring,
-  bump a counter. No allocation, no locks, no Qt.
-- **A slow consumer cannot stall capture.** The bounded queue plus a dedicated consumer
-  thread absorb it; drops are counted and surfaced rather than hidden.
-- **Testable without hardware.** `FileSource` replays a WAV through the identical path, and
-  a fake `sounddevice` covers device enumeration — so the suite runs anywhere.
+- Everything upstream of the wake-phrase gate is a generic low-latency audio pipeline:
+  sample-exact windows, a lock-free ring buffer, a bounded queue so a slow consumer can
+  never stall the mic thread.
+- The gate only starts caring once Vosk hears "ok google"/"hey google" — matched on whole
+  words, so "look google it" doesn't trigger it.
+- CAMPPlus (via ONNX Runtime QNN) turns that clip into a voice embedding and compares it
+  against everyone enrolled.
+- The result decides one thing: call `adb shell pm grant/revoke` on the Google app's
+  `RECORD_AUDIO` permission. A crash-safety timer auto-restores it after 20 minutes no
+  matter what, so a killed process can never leave your Assistant permanently blocked.
+
+Every stage is optional and off by default — turn on only what you want, and the pipeline
+degrades gracefully (a missing model, a disconnected phone, no adb found) instead of
+crashing.
 
 ## Layout
 
 | Path | What lives there |
 |---|---|
-| `echochamber/config.py` | `AudioConfig`: window/hop geometry, validation |
-| `echochamber/audio/ringbuffer.py` | SPSC ring with a doubled-write layout (contiguous reads) |
-| `echochamber/audio/chunker.py` | The windowing thread |
-| `echochamber/audio/sinks.py` | `QueueSink`, `TeeSink`, `WavRecorderSink`, latency tracking |
-| `echochamber/audio/sources/` | `FileSource` (replay) and `SoundDeviceSource` (live) |
-| `echochamber/audio/pipeline.py` | Wires it together |
-| `echochamber/voicegate/` | Wake-phrase gate: record a snippet only when a phrase is said |
-| `echochamber/ui/` | PySide6 GUI; all logic in `controller.py`, widgets stay dumb |
-| `docs/architecture.md` | Design rationale, latency model, and the hard-won gotchas |
+| `echochamber/config.py`, `echochamber/audio/` | Core capture pipeline: ring buffer, windowing, sinks |
+| `echochamber/voicegate/` | Wake-phrase detection (Vosk) and the snippet gate |
+| `echochamber/speakerid/` | Speaker enrollment + verification (CAMPPlus / ONNX QNN) |
+| `echochamber/adb/` | The ADB hotword-blocking trigger |
+| `echochamber/ui/` | The GUI — `controller.py` holds all logic, panels stay dumb |
+| `scripts/` | One-time setup: model downloads, venv builds, CLI enrollment |
+| `docs/architecture.md` | Deep design rationale, latency model, and every hard-won gotcha |
 
-## Wake-phrase voice gate
+## Notes for developers
 
-Off by default. When enabled, the pipeline stops keeping everything and keeps only what
-follows a configured phrase — `"ok google"`, `"hey google"` — as one WAV snippet each.
+- **Platform**: developed on Windows x86-64, deployed to Windows ARM64. Every dependency
+  with a compiled extension needs a verified `win_arm64` wheel — that's why Vosk and the
+  CAMPPlus/torch stack each run in their own subprocess venv instead of in-process.
+- **WASAPI won't resample for you.** A 16 kHz request on a 48 kHz device fails unless the
+  stream opens with `WasapiSettings(auto_convert=True)` — already handled, just noted here
+  because it bites anyone extending the audio source.
+- **Everything is optional and additive.** With no models installed at all, the app is
+  still a fully working low-latency audio capture tool with live meters — the wake-phrase
+  gate, speaker ID, and ADB trigger are three independent layers stacked on top.
+- Prefer a terminal to a GUI? `python scripts/enroll_speaker.py --help` covers enrolling,
+  listing, and removing speakers from the command line, `--wav` included.
+- Full design rationale and the WebSocket event-notification feature (push a `detected`/
+  `snippet` event to any listener) live in `docs/architecture.md`.
+- Run the test suite (no microphone or phone required — everything is mocked/replayed):
 
-To turn it on:
-
-```bash
-pip install .[voice-gate]              # x86-64 only, skip on ARM64 — see below
-python scripts/setup_voice_gate.py     # fetches the model, builds the recognizer venv
-```
-
-The script prints a `worker_python` path and a `model_path` — pass both into
-`VoiceGateConfig(enabled=True, ...)` in your app config.
-
-It is a `ChunkSink` composed alongside the existing one, so nothing upstream changes.
-Matching is on whole words, so `"ok google"` fires on `"ok google turn it up"` but not on
-`"look google it"`.
-
-**The clip is the hotword, not a window around it.** Vosk reports per-word timestamps, and
-the gate uses them to cut exactly `[phrase start − lead_ms, phrase end + trail_ms]` out of
-its lookback buffer — about a second, instead of the 4.5 s guess a fixed pre/post-roll
-would produce. `ClipMode.WINDOW` restores that older behaviour when you want the *command*
-after the wake word rather than the wake word itself.
-
-If the timings are missing or fail a sanity check, the gate falls back to the window and
-counts it. Watch `clips_fallback`: a fallback clip is a *wider* clip, not a missing one, so
-the snippet count still climbs and the file still plays — that counter is the only thing
-that tells you the audio isn't the hotword it's named after.
-
-**`vosk` has no `win_arm64` wheel**, and the deployment target is Windows ARM64. So on
-ARM64 vosk is not installed into the main environment at all: it runs in a separate
-**x64** venv as a subprocess (Windows' Prism emulator runs it transparently) and the gate
-talks to it over a pipe, keeping the real-time capture path native. `setup_voice_gate.py`
-prints exactly what to configure. See `docs/architecture.md` §3.7 for the full rationale —
-including what has *not* yet been verified on real ARM64 hardware.
-
-Recognition is pluggable and absent by default: with no vosk and no model, the gate is
-inert and the entire test suite still passes.
-
-### Announcing detections
-
-The gate can push events to a WebSocket listener (`pip install .[notify]`):
-
-```python
-NotifyConfig(enabled=True, url="ws://127.0.0.1:8765", include_audio=True)
-```
-
-Two events per utterance. `detected` goes out **the moment the phrase is recognized**;
-`snippet` follows when the file closes — `post_roll_ms` later — and carries the WAV when
-`include_audio` is set. They share a `seq`, so a listener can pair them:
-
-```json
-{"type":"detected","phrase":"ok google","text":"ok google turn it up","seq":0,"sample_rate":16000,"timestamp":1786122719.665}
-{"type":"snippet","phrase":"ok google","seq":0,"path":"...","frames":17600,"duration_s":1.1,"truncated":false,"audio":{"encoding":"base64","format":"wav","bytes":35244,"data":"..."}}
-```
-
-The `audio` is the hotword clip itself (~1 s), so `include_audio` defaults on.
-
-Sending happens on its own thread behind a bounded queue — a socket write to a dead host
-takes a TCP timeout to fail, and doing that on the consumer thread would stall the
-pipeline and drop audio. A listener that cannot keep up costs counted, visible dropped
-events instead. Best-effort only: no acknowledgement, no redelivery, and queued events are
-discarded at shutdown.
-
-## Two things that will bite you
-
-**WASAPI will not resample unless you ask it to.** A 16 kHz request on a 48 kHz device fails
-with `Invalid sample rate [PaErrorCode -9997]` unless the stream is opened with
-`WasapiSettings(auto_convert=True)`. Nearly every Windows capture device is 44.1 or 48 kHz.
-
-**After an overrun, `start_frame` is not a multiple of `hop`.** The grid restarts wherever
-surviving audio begins. Use `seq`, which is gap-free; such chunks are flagged `discontinuous`.
-
-Both are covered in more detail in `docs/architecture.md`.
-
-## Platform
-
-Developed on Windows x86-64, **deployed to Windows ARM64**. Every dependency with a compiled
-extension needs a verified `win_arm64` wheel before adoption.
+  ```bash
+  pytest
+  ```
