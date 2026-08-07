@@ -374,9 +374,12 @@ class SubprocessRecognizer:
                 f"{self._startup_timeout_s:g} s"
             )
         if not self._ready_ok:
+            reported = self._worker_error
             self._fail_startup(
-                self._worker_error
-                or "the worker exited before reporting readiness"
+                "the worker reported a failure while loading the model"
+                if reported
+                else "the worker exited before reporting readiness",
+                reported=reported,
             )
 
     def accept_pcm(self, pcm: bytes) -> list[Recognition]:
@@ -539,15 +542,18 @@ class SubprocessRecognizer:
             return False
         return True
 
-    def _fail_startup(self, reason: str) -> None:
+    def _fail_startup(self, reason: str, reported: str | None = None) -> None:
         """Tear the worker down and raise a :class:`RecognizerStartupError`.
 
         Args:
-            reason: What went wrong, in a sentence.
+            reason: What went wrong, in one line.
+            reported: The body of the worker's ``ERROR`` frame, if it sent one.
+                Kept out of ``reason`` because it is a whole traceback, and a
+                traceback spliced into the middle of a sentence is unreadable.
 
         Raises:
-            RecognizerStartupError: Always, with :attr:`stderr_tail` appended
-                when the worker said anything.
+            RecognizerStartupError: Always, quoting the command, the worker's
+                own report and :attr:`stderr_tail`.
         """
         # Give the stderr drainer a moment: the process can be gone before its
         # traceback has been read, and the traceback is the whole point.
