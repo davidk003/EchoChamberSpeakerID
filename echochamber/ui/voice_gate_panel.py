@@ -61,6 +61,8 @@ _ROWS: tuple[tuple[str, str], ...] = (
     ("suppressed", "gate_suppressed"),
     ("truncated", "gate_truncated"),
     ("last phrase", "gate_last_phrase"),
+    ("notify", "notify_state"),
+    ("events sent", "notify_sent"),
 )
 """``(label, key)`` in display order; ``key`` also names the value widget."""
 
@@ -93,6 +95,47 @@ def format_phrases(phrases: tuple[str, ...]) -> str:
         unchanged.
     """
     return f"{PHRASE_SEPARATOR} ".join(phrases)
+
+
+def _notify_state_text(stats: UiStats) -> str:
+    """Render the notifier's connection state in one word or two.
+
+    Args:
+        stats: The current snapshot.
+
+    Returns:
+        ``"off"`` when notifications are disabled, ``"connected"`` when the
+        socket is open, ``"connecting"`` otherwise.  "connecting" rather than
+        "disconnected" because the sender retries with backoff forever, so a
+        down listener is a state it is working through, not a terminal one.
+    """
+    if not stats.notify_enabled:
+        return "off"
+    return "connected" if stats.notify_connected else "connecting"
+
+
+def _notify_sent_text(stats: UiStats) -> str:
+    """Render the events-sent counter, naming drops and backlog when non-zero.
+
+    Args:
+        stats: The current snapshot.
+
+    Returns:
+        ``"12"``, or ``"12 (2 dropped)"``, or ``"12 (3 queued)"``.  A bare count
+        would let a notifier that is silently discarding every event look
+        identical to one that has simply heard nothing yet.
+    """
+    if not stats.notify_enabled:
+        return "—"
+    text = f"{stats.notify_sent:,}"
+    extra: list[str] = []
+    if stats.notify_dropped:
+        extra.append(f"{stats.notify_dropped:,} dropped")
+    if stats.notify_queued:
+        extra.append(f"{stats.notify_queued:,} queued")
+    if extra:
+        text = f"{text} ({', '.join(extra)})"
+    return text
 
 
 class VoiceGatePanel(QWidget):
@@ -237,6 +280,8 @@ class VoiceGatePanel(QWidget):
             # An em dash rather than an empty cell: a blank next to a label
             # reads as a rendering failure, not as "nothing yet".
             "gate_last_phrase": stats.gate_last_phrase or "—",
+            "notify_state": _notify_state_text(stats),
+            "notify_sent": _notify_sent_text(stats),
         }
         for key, text in rendered.items():
             self._values[key].setText(text)
@@ -244,8 +289,21 @@ class VoiceGatePanel(QWidget):
         self._values["gate_snippets"].setStyleSheet(
             _HIT_STYLE if stats.gate_snippets else ""
         )
+        # A notifier that is on but disconnected, or dropping events, is the
+        # failure this row exists to make visible: events are being generated
+        # and nobody is receiving them.
+        broken = stats.notify_enabled and (
+            not stats.notify_connected or stats.notify_dropped
+        )
+        self._values["notify_state"].setStyleSheet(_WARN_STYLE if broken else "")
+        self._values["notify_sent"].setStyleSheet(
+            _WARN_STYLE if stats.notify_dropped else ""
+        )
+
         if stats.gate_error:
             self.set_note(stats.gate_error, warning=True)
+        elif stats.notify_error:
+            self.set_note(f"notify: {stats.notify_error}", warning=True)
 
     def _on_toggled(self, checked: bool) -> None:
         """Emit the user's new enable state.

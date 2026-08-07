@@ -36,6 +36,13 @@ dev = [
 voice-gate = [
     "vosk>=0.3.45",
 ]
+# Sending wake-phrase events over a WebSocket. Unlike vosk this carries no
+# ARM64 risk at all: websocket-client is pure Python (a py3-none-any wheel),
+# so it installs anywhere. Kept optional anyway because opening a network
+# connection is not something a capture tool should start doing by default.
+notify = [
+    "websocket-client>=1.7",
+]
 
 [project.scripts]
 echochamber = "echochamber.app:main"

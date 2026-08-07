@@ -57,6 +57,14 @@ from echochamber.voicegate.backends import (
     describe_backend,
 )
 from echochamber.voicegate.config import VoiceGateConfig
+from echochamber.voicegate.notify import (
+    NotifyConfig,
+    NotifyStats,
+    Transport,
+    WebSocketNotifier,
+    build_transport,
+)
+from echochamber.voicegate.relay import NotifyRelay
 from echochamber.voicegate.sink import VoiceGateSink, VoiceGateStats
 
 __all__ = [
@@ -145,6 +153,13 @@ class UiStats:
         gate_error: Whatever the gate last failed at, or ``None``.  A gate that
             has stopped producing snippets is either hearing nothing or broken,
             and this is how a display tells those apart.
+        notify_enabled: Whether wake-phrase notifications are configured on.
+        notify_connected: Whether the notifier currently holds an open socket.
+        notify_sent: Events written to the socket.
+        notify_dropped: Events discarded because the send queue was full --
+            non-zero means the listener cannot keep up, or is not there.
+        notify_queued: Events waiting to be sent.
+        notify_error: The notifier's most recent failure, or ``None``.
     """
 
     state: CaptureState
@@ -171,6 +186,12 @@ class UiStats:
     gate_last_phrase: str = ""
     gate_last_path: str | None = None
     gate_error: str | None = None
+    notify_enabled: bool = False
+    notify_connected: bool = False
+    notify_sent: int = 0
+    notify_dropped: int = 0
+    notify_queued: int = 0
+    notify_error: str | None = None
 
 
 class LatestChunkSink:
@@ -380,6 +401,8 @@ class CaptureController(QObject):
         parent: QObject | None = None,
         voice_gate: VoiceGateConfig | None = None,
         recognizer_builder: Callable[..., RecognizerChoice] | None = None,
+        notify: NotifyConfig | None = None,
+        transport_builder: Callable[..., tuple[Transport, str | None]] | None = None,
     ) -> None:
         """Create a stopped controller.  Nothing is enumerated or opened yet.
 
@@ -412,6 +435,16 @@ class CaptureController(QObject):
                 is the seam that lets a test drive the gate with a scripted
                 recogniser and no model -- the same role
                 ``source_factory_builder`` plays for the microphone.
+            notify: Wake-phrase notification configuration; a disabled default
+                :class:`~echochamber.voicegate.notify.NotifyConfig` when
+                ``None``, which opens no socket and starts no thread.
+            transport_builder: Callable returning
+                ``(transport, error)``, called with the notify config at
+                :meth:`start`.  Defaults to
+                :func:`~echochamber.voicegate.notify.build_transport`.  A test
+                injects a
+                :class:`~echochamber.voicegate.notify.RecordingTransport` and
+                never touches a network.
         """
         super().__init__(parent)
 
@@ -428,11 +461,19 @@ class CaptureController(QObject):
         self._recognizer_builder: Callable[..., RecognizerChoice] = (
             build_recognizer if recognizer_builder is None else recognizer_builder
         )
+        self._notify_config: NotifyConfig = (
+            NotifyConfig() if notify is None else notify
+        )
+        self._transport_builder: Callable[..., tuple[Transport, str | None]] = (
+            build_transport if transport_builder is None else transport_builder
+        )
         self._gate_sink: VoiceGateSink | None = None
         self._gate_backend: str = "none"
+        self._notifier: WebSocketNotifier | None = None
         # Survives stop(), like the latency figures: a run that just finished is
         # exactly when you want to read what the gate caught.
         self._gate_stats: VoiceGateStats = VoiceGateStats()
+        self._notify_stats: NotifyStats = NotifyStats()
 
         self._state: CaptureState = CaptureState.STOPPED
         self._devices: list[DeviceInfo] = []
@@ -515,6 +556,16 @@ class CaptureController(QObject):
     def gate_sink(self) -> VoiceGateSink | None:
         """The live gate sink, or ``None`` when stopped or the gate is off."""
         return self._gate_sink
+
+    @property
+    def notify_config(self) -> NotifyConfig:
+        """The notification configuration the next :meth:`start` will use."""
+        return self._notify_config
+
+    @property
+    def notifier(self) -> WebSocketNotifier | None:
+        """The live notifier, or ``None`` when stopped or notifications are off."""
+        return self._notifier
 
     @property
     def poll_timer(self) -> QTimer:
@@ -631,6 +682,9 @@ class CaptureController(QObject):
                     gate_sink.close()
                 except Exception:  # noqa: BLE001 - teardown of a failed start
                     pass
+            # The notifier is started before the pipeline exists, so a failure
+            # in between would otherwise leave its thread and socket running.
+            self._close_notifier()
             self._pipeline = None
             self._sink = None
             self._gate_sink = None
@@ -642,6 +696,7 @@ class CaptureController(QObject):
         self._sink = sink
         self._gate_sink = gate_sink
         self._gate_stats = VoiceGateStats()
+        self._notify_stats = NotifyStats()
         self._peak_hold.reset()
         self._last_snapshot = StreamStats()
         self._latency_ms = 0.0
@@ -691,6 +746,9 @@ class CaptureController(QObject):
         # final snippet: AudioPipeline.stop closes the sink, which finalizes
         # anything still recording.
         self._sample_gate()
+        # Sampled before the notifier is closed, since closing drops whatever is
+        # still queued and zeroes `connected`.
+        self._sample_notifier()
         gate_sink = self._gate_sink
         if gate_sink is not None:
             # AudioPipeline.stop already closed the tee, and close is
@@ -700,6 +758,8 @@ class CaptureController(QObject):
                 gate_sink.close()
             except Exception as exc:  # noqa: BLE001 - reported, not raised
                 self.error_occurred.emit(f"error while stopping the voice gate: {exc}")
+
+        self._close_notifier()
 
         self._pipeline = None
         self._sink = None
@@ -838,6 +898,7 @@ class CaptureController(QObject):
             except Exception:  # noqa: BLE001 - a display tick must never raise
                 pass
             self._sample_gate()
+            self._sample_notifier()
 
             error = _pipeline_error(pipeline)
             if error is not None and not self._error_reported:
@@ -877,6 +938,7 @@ class CaptureController(QObject):
         # exactly when you want to read what it achieved.
         latency = self._latency_tracker.summary()
         gate = self._gate_stats
+        notify = self._notify_stats
         return UiStats(
             state=self._state,
             frames_captured=raw.frames_captured,
@@ -902,7 +964,40 @@ class CaptureController(QObject):
             gate_last_phrase=gate.last_phrase,
             gate_last_path=gate.last_snippet_path,
             gate_error=gate.error,
+            notify_enabled=self._notify_config.enabled,
+            notify_connected=notify.connected,
+            notify_sent=notify.sent,
+            notify_dropped=notify.dropped,
+            notify_queued=notify.queued,
+            notify_error=notify.error,
         )
+
+    def _sample_notifier(self) -> None:
+        """Refresh the cached notification counters, never raising."""
+        notifier = self._notifier
+        if notifier is None:
+            return
+        try:
+            self._notify_stats = notifier.snapshot()
+        except Exception:  # noqa: BLE001 - a display tick must never raise
+            pass
+
+    def _close_notifier(self) -> None:
+        """Shut the notifier down, reporting rather than raising.
+
+        Its thread is a daemon, so a process exit would collect it either way --
+        but a notifier left running across a stop/start would have two threads
+        writing to the same endpoint, and the second run's counters would
+        include the first run's backlog.
+        """
+        notifier = self._notifier
+        self._notifier = None
+        if notifier is None:
+            return
+        try:
+            notifier.close()
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            self.error_occurred.emit(f"error while stopping notifications: {exc}")
 
     def _sample_gate(self) -> None:
         """Refresh the cached voice-gate counters, never raising.
@@ -952,12 +1047,40 @@ class CaptureController(QObject):
             # anything half-built, so there is nothing to clean up here.
             return None, describe_backend(choice)
 
+        relay, note = self._build_notifier()
         sink = VoiceGateSink(
             gate_config,
             self._config.sample_rate,
             recognizer=choice.recognizer,
+            on_snippet=None if relay is None else relay.on_snippet,
+            on_detected=None if relay is None else relay.on_detected,
         )
-        return sink, ""
+        return sink, note
+
+    def _build_notifier(self) -> tuple[NotifyRelay | None, str]:
+        """Start the notifier for this run, if notifications are enabled.
+
+        A missing optional package or an unreachable endpoint is a note, not a
+        failure: the notifier connects on its own thread precisely so a
+        listener that is down cannot delay or prevent a capture.
+
+        Returns:
+            ``(relay, note)``.  ``relay`` is ``None`` when notifications are off
+            or the transport could not be built; ``note`` is a message to show
+            the user, empty when there is nothing worth saying.
+        """
+        config = self._notify_config
+        if not config.enabled:
+            return None, ""
+
+        transport, error = self._transport_builder(config)
+        if error is not None:
+            return None, f"notifications disabled: {error}"
+
+        notifier = WebSocketNotifier(config, transport)
+        notifier.start()
+        self._notifier = notifier
+        return NotifyRelay(notifier, self._config.sample_rate, config), ""
 
     def _build_factory(self) -> SourceFactory:
         """Ask ``source_factory_builder`` for a factory for the current selection.

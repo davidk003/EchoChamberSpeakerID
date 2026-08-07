@@ -74,10 +74,53 @@ from echochamber.voicegate.snippets import (
     snippet_filename,
 )
 
-__all__ = ["SnippetEvent", "VoiceGateSink", "VoiceGateStats"]
+__all__ = ["DetectionEvent", "SnippetEvent", "VoiceGateSink", "VoiceGateStats"]
 
 _BYTES_PER_FRAME: int = 2
 """Bytes per frame on the wire to the recogniser: mono, 16-bit."""
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionEvent:
+    """A wake phrase, announced the moment it is recognised.
+
+    **This fires well before the snippet exists.**  A snippet is not closed
+    until its post-roll has elapsed -- three seconds, by default -- so anything
+    that wants to react promptly to a wake phrase has to be told here rather
+    than waiting for :class:`SnippetEvent`.  The two share a :attr:`seq`, which
+    is how a listener pairs them.
+
+    A *suppressed* match does not produce one of these.  Suppression exists
+    because small models re-report the same phrase across consecutive results,
+    so those are duplicates of a detection already announced, and forwarding
+    them would announce one utterance several times.
+
+    Attributes:
+        phrase: The matched wake phrase, normalised.
+        text: The full recognised text the phrase was found in.
+        seq: Counter of the snippet this detection belongs to, from 0.  A
+            detection that extends an open snippet carries that snippet's
+            ``seq``, not a new one.
+        start_frame: Absolute frame index of the audio the gate had consumed
+            when the phrase was recognised.
+        timestamp: UNIX time the detection was announced.
+        extended: ``True`` when this detection landed inside an already-open
+            snippet and pushed its post-roll out, rather than opening a file.
+    """
+
+    phrase: str
+    text: str
+    seq: int
+    start_frame: int
+    timestamp: float
+    extended: bool = False
+
+    def __repr__(self) -> str:
+        """Return a debugging representation naming the phrase and snippet."""
+        return (
+            f"{type(self).__name__}(phrase={self.phrase!r}, seq={self.seq}, "
+            f"extended={self.extended})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +146,10 @@ class SnippetEvent:
         truncated: ``True`` if the snippet hit
             :attr:`~echochamber.voicegate.config.VoiceGateConfig.max_snippet_ms`
             and was cut, rather than closing because its post-roll elapsed.
+        timestamp: UNIX time the snippet was closed -- which is ``post_roll_ms``
+            or more after the detection that opened it, not the moment the
+            phrase was heard.  Pair with :attr:`DetectionEvent.timestamp` on
+            ``seq`` to recover both.
     """
 
     path: str
@@ -113,6 +160,7 @@ class SnippetEvent:
     frames: int
     duration_s: float
     truncated: bool
+    timestamp: float = 0.0
 
     def __repr__(self) -> str:
         """Return a debugging representation naming the file and phrase."""
@@ -194,6 +242,7 @@ class VoiceGateSink:
         "_sample_rate",
         "_recognizer",
         "_on_snippet",
+        "_on_detected",
         "_clock",
         "_phrases",
         "_post_roll_frames",
@@ -230,6 +279,7 @@ class VoiceGateSink:
         recognizer: Recognizer | None = None,
         on_snippet: Callable[[SnippetEvent], None] | None = None,
         clock: Callable[[], float] | None = None,
+        on_detected: Callable[[DetectionEvent], None] | None = None,
     ) -> None:
         """Wire a gate to a recogniser.
 
@@ -251,6 +301,11 @@ class VoiceGateSink:
             clock: Source of UNIX timestamps for snippet filenames, defaulting
                 to :func:`time.time`.  Injected so a test can assert on an
                 exact filename without freezing the clock.
+            on_detected: Called with a :class:`DetectionEvent` the moment a
+                phrase is recognised -- before the snippet exists, and not at
+                all for a suppressed duplicate.  Runs on the consumer thread, so
+                it must not block; an exception it raises is recorded in
+                :attr:`error` and otherwise ignored.
 
         Raises:
             ValueError: If ``sample_rate`` is not positive.
@@ -265,6 +320,7 @@ class VoiceGateSink:
             NullRecognizer() if recognizer is None else recognizer
         )
         self._on_snippet: Callable[[SnippetEvent], None] | None = on_snippet
+        self._on_detected: Callable[[DetectionEvent], None] | None = on_detected
         self._clock: Callable[[], float] = time.time if clock is None else clock
 
         # The config is frozen, so normalising the phrases once here is safe
@@ -527,9 +583,13 @@ class VoiceGateSink:
             # would give two files that each cut the other's audio in half.
             self._post_roll_left = self._post_roll_frames
             self._snippet_text = text
+            self._emit_detected(found, text, extended=True)
             return
 
         self._open_snippet(found, text)
+        # After the snippet is open, so the event carries the seq of the file
+        # this detection actually belongs to rather than the previous one's.
+        self._emit_detected(found, text, extended=False)
 
     def _open_snippet(self, found: PhraseMatch, text: str) -> None:
         """Start a new snippet file and prime it with the pre-roll.
@@ -642,6 +702,7 @@ class VoiceGateSink:
                 frames=writer.frames_written,
                 duration_s=writer.duration_s,
                 truncated=truncated,
+                timestamp=self._clock(),
             )
         )
 
@@ -687,6 +748,34 @@ class VoiceGateSink:
             self._recognizer.reset()
         except Exception as exc:  # noqa: BLE001 - a decoder fault must not kill
             self._fail("resetting the recogniser", exc)
+
+    def _emit_detected(
+        self, found: PhraseMatch, text: str, extended: bool
+    ) -> None:
+        """Announce a detection, swallowing anything the callback raises.
+
+        Args:
+            found: The phrase that matched.
+            text: The full recognised text.
+            extended: Whether this detection extended an open snippet rather
+                than opening one.
+        """
+        callback = self._on_detected
+        if callback is None:
+            return
+        try:
+            callback(
+                DetectionEvent(
+                    phrase=found.phrase,
+                    text=text,
+                    seq=self._snippet_seq,
+                    start_frame=self._next_expected or 0,
+                    timestamp=self._clock(),
+                    extended=extended,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a callback must not kill
+            self._fail("the detection callback", exc)
 
     def _emit(self, event: SnippetEvent) -> None:
         """Hand ``event`` to the callback, swallowing anything it raises.

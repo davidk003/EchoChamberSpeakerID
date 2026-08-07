@@ -21,6 +21,12 @@ preference -- see :mod:`echochamber.voicegate.subprocess_recognizer`.
 from __future__ import annotations
 
 from echochamber.voicegate.config import VoiceGateConfig
+from echochamber.voicegate.notify import (
+    EventKind,
+    NotifyConfig,
+    NotifyEvent,
+    WebSocketNotifier,
+)
 from echochamber.voicegate.matching import (
     PhraseMatch,
     match_phrase,
@@ -34,11 +40,15 @@ from echochamber.voicegate.recognizer import (
 )
 
 __all__ = [
+    "EventKind",
+    "NotifyConfig",
+    "NotifyEvent",
     "NullRecognizer",
     "PhraseMatch",
     "Recognition",
     "Recognizer",
     "VoiceGateConfig",
+    "WebSocketNotifier",
     "match_phrase",
     "normalize",
     "tokenize",
