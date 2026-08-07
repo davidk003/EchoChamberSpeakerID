@@ -47,6 +47,19 @@ class AudioChunk:
         discontinuous: ``True`` if audio was lost (overrun) or the window
             geometry was reconfigured immediately before this chunk, so
             downstream must not assume continuity with the previous chunk.
+        capture_time: ``time.perf_counter()`` reading taken when the chunker
+            emitted this chunk, i.e. just after its final sample was available.
+            A consumer measures its own end-to-end latency as
+            ``time.perf_counter() - capture_time``.
+
+            **Use perf_counter, not monotonic, to compare against this.** Both
+            are monotonic, but on Windows ``time.monotonic()`` is
+            ``GetTickCount64`` with **15.625 ms** resolution, which quantises a
+            sub-millisecond handoff into alternating 0 ms and 16 ms readings --
+            noise that looks exactly like real latency spikes.
+            ``perf_counter`` is ``QueryPerformanceCounter``, ~100 ns.
+
+            ``0.0`` means unset (a chunk built by hand in a test).
     """
 
     samples: np.ndarray
@@ -54,6 +67,7 @@ class AudioChunk:
     seq: int
     sample_rate: int
     discontinuous: bool = False
+    capture_time: float = 0.0
 
     @property
     def n_frames(self) -> int:
@@ -69,6 +83,21 @@ class AudioChunk:
     def start_time_s(self) -> float:
         """Start time of this chunk in seconds since stream start."""
         return self.start_frame / self.sample_rate
+
+    def age_s(self, now: float) -> float:
+        """Seconds between this chunk being emitted and ``now``.
+
+        ``now`` is supplied by the caller (a :func:`time.perf_counter` reading)
+        rather than read here, so latency accounting stays testable without
+        sleeping.  Returns 0.0 when :attr:`capture_time` was never set, and is
+        clamped at 0.0 so a caller can never see a negative latency.
+
+        Passing a :func:`time.monotonic` reading here mixes two unrelated clock
+        origins and yields nonsense; see :attr:`capture_time`.
+        """
+        if not self.capture_time:
+            return 0.0
+        return max(0.0, now - self.capture_time)
 
 
 @dataclass(slots=True)

@@ -44,6 +44,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from echochamber.audio.devices import DeviceInfo, list_input_devices
+from echochamber.audio.latency import LatencyTracker
 from echochamber.audio.pipeline import AudioPipeline, SourceFactory
 from echochamber.audio.sources.sounddevice_source import SoundDeviceSource
 from echochamber.audio.types import AudioChunk, StreamStats
@@ -111,9 +112,18 @@ class UiStats:
         elapsed_s: Seconds since :meth:`CaptureController.start`, frozen at the
             value it had when capture stopped.
         latency_ms: Input latency the device reports, in milliseconds; ``0.0``
-            whenever nothing is running.
+            whenever nothing is running.  This is the *device buffer* only --
+            see the pipeline figures below for what a consumer actually waits.
         message: Human-readable note, normally empty; carries the failure text
             in :attr:`CaptureState.ERROR`.
+        pipeline_p50_ms: Median measured latency from a window being complete to
+            a consumer receiving it.  Dominated by ``window_ms`` by design, since
+            a window cannot be emitted until its last sample exists.
+        pipeline_p95_ms: The slowest 1-in-20.  This is the number that reveals a
+            struggling consumer, which a mean would hide.
+        pipeline_max_ms: Worst observation in the rolling window.
+        latency_samples: How many observations the percentiles are drawn from;
+            0 means the figures are not yet meaningful.
     """
 
     state: CaptureState
@@ -128,6 +138,10 @@ class UiStats:
     elapsed_s: float
     latency_ms: float
     message: str = ""
+    pipeline_p50_ms: float = 0.0
+    pipeline_p95_ms: float = 0.0
+    pipeline_max_ms: float = 0.0
+    latency_samples: int = 0
 
 
 class LatestChunkSink:
@@ -144,13 +158,28 @@ class LatestChunkSink:
     window length, and gives a stable trace to draw.
     """
 
-    __slots__ = ("_preview_points", "_lock", "_seq", "_start_frame", "_preview", "_closed")
+    __slots__ = (
+        "_preview_points",
+        "_tracker",
+        "_lock",
+        "_seq",
+        "_start_frame",
+        "_preview",
+        "_closed",
+    )
 
-    def __init__(self, preview_points: int = 512) -> None:
+    def __init__(
+        self,
+        preview_points: int = 512,
+        tracker: LatencyTracker | None = None,
+    ) -> None:
         """Create an empty sink.
 
         Args:
             preview_points: Maximum number of points in the decimated preview.
+            tracker: Latency tracker to record into; one is created when
+                ``None``.  Pass a shared instance to keep observations across a
+                stop/start cycle.
 
         Raises:
             ValueError: If ``preview_points`` is not positive.
@@ -160,6 +189,9 @@ class LatestChunkSink:
             raise ValueError(f"preview_points must be > 0, got {preview_points}")
 
         self._preview_points: int = preview_points
+        self._tracker: LatencyTracker = (
+            LatencyTracker() if tracker is None else tracker
+        )
         self._lock = threading.Lock()
         self._seq: int = -1
         self._start_frame: int = 0
@@ -191,14 +223,31 @@ class LatestChunkSink:
     def on_chunk(self, chunk: AudioChunk) -> None:
         """Record ``chunk``.  Called on the consumer thread; touches no Qt.
 
+        Latency is measured here rather than in the GUI because this is the
+        first moment the audio has actually reached a consumer -- it therefore
+        includes the queueing and thread scheduling that a timer on the GUI side
+        would never see.
+
         Args:
             chunk: The completed window handed over by the pipeline.
         """
+        # perf_counter to match AudioChunk.capture_time; time.monotonic() is
+        # GetTickCount64 on Windows and would quantise this to 0 or 16 ms.
+        self._tracker.record(chunk.age_s(time.perf_counter()))
         preview = _decimate(chunk.samples, self._preview_points)
         with self._lock:
             self._seq = chunk.seq
             self._start_frame = chunk.start_frame
             self._preview = preview
+
+    @property
+    def tracker(self) -> LatencyTracker:
+        """Rolling latency observations recorded by this sink."""
+        return self._tracker
+
+    def latency_summary(self) -> LatencySummary:
+        """Latency percentiles so far.  Safe to call from the GUI thread."""
+        return self._tracker.summary()
 
     def close(self) -> None:
         """Mark the sink closed.  Idempotent; the recorded snapshot survives.
@@ -337,6 +386,9 @@ class CaptureController(QObject):
         self._selected_device: DeviceInfo | None = None
         self._pipeline: AudioPipeline | None = None
         self._sink: LatestChunkSink | None = None
+        # Owned by the controller, not the sink, so the figures from a finished
+        # run survive stop() -- that is precisely when you want to read them.
+        self._latency_tracker: LatencyTracker = LatencyTracker()
         self._peak_hold: PeakHold = PeakHold()
 
         self._start_time: float = 0.0
@@ -386,6 +438,15 @@ class CaptureController(QObject):
     def sink(self) -> LatestChunkSink | None:
         """The recording sink of the live pipeline, or ``None``."""
         return self._sink
+
+    @property
+    def latency_tracker(self) -> LatencyTracker:
+        """Measured end-to-end latency for the current or most recent run.
+
+        Outlives the pipeline deliberately, so the figures are still readable
+        after :meth:`stop`.  Cleared at the start of each run.
+        """
+        return self._latency_tracker
 
     @property
     def peak_hold(self) -> PeakHold:
@@ -479,7 +540,10 @@ class CaptureController(QObject):
         pipeline: AudioPipeline | None = None
         try:
             factory = self._build_factory()
-            sink = LatestChunkSink()
+            # A fresh run starts with fresh percentiles; the previous run's
+            # figures would otherwise blend into this one's.
+            self._latency_tracker.reset()
+            sink = LatestChunkSink(tracker=self._latency_tracker)
             pipeline = AudioPipeline(self._config, sink, factory, StreamStats())
             pipeline.start()
         except Exception as exc:  # noqa: BLE001 - every failure is reported, not raised
@@ -637,6 +701,9 @@ class CaptureController(QObject):
             elapsed = time.monotonic() - self._start_time
         else:
             elapsed = self._elapsed_at_stop
+        # Latency figures survive stopping on purpose: the run just finished is
+        # exactly when you want to read what it achieved.
+        latency = self._latency_tracker.summary()
         return UiStats(
             state=self._state,
             frames_captured=raw.frames_captured,
@@ -650,6 +717,10 @@ class CaptureController(QObject):
             elapsed_s=elapsed,
             latency_ms=self._latency_ms if running else 0.0,
             message=self._message,
+            pipeline_p50_ms=latency.p50_ms,
+            pipeline_p95_ms=latency.p95_ms,
+            pipeline_max_ms=latency.max_ms,
+            latency_samples=latency.count,
         )
 
     def _build_factory(self) -> SourceFactory:

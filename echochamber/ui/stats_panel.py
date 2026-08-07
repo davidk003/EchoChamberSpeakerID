@@ -31,11 +31,26 @@ _ROWS: tuple[tuple[str, str], ...] = (
     ("overruns", "overruns"),
     ("xruns", "xruns"),
     ("device latency", "latency_ms"),
+    ("pipeline p50", "pipeline_p50_ms"),
+    ("pipeline p95", "pipeline_p95_ms"),
+    ("pipeline max", "pipeline_max_ms"),
 )
 """``(label, key)`` in display order; ``key`` also names the value widget."""
 
 _FAULT_KEYS: frozenset[str] = frozenset({"chunks_dropped", "overruns", "xruns"})
 """Counters that mean something is wrong as soon as they are non-zero."""
+
+
+def _latency_text(value_ms: float, samples: int) -> str:
+    """Render a latency percentile, or a dash when nothing has been measured.
+
+    A percentile over zero observations is not 0 ms; it is unknown. Printing
+    "0.0 ms" would advertise an impossibly fast pipeline before the first chunk
+    has even arrived.
+    """
+    if samples <= 0:
+        return "--"
+    return f"{value_ms:.1f} ms"
 
 
 class StatsPanel(QWidget):
@@ -99,6 +114,11 @@ class StatsPanel(QWidget):
             "overruns": f"{stats.overruns:,}",
             "xruns": f"{stats.xruns:,}",
             "latency_ms": f"{stats.latency_ms:.1f} ms",
+            # Percentiles are meaningless before any chunk has been measured;
+            # showing "0.0 ms" would read as an impossibly fast pipeline.
+            "pipeline_p50_ms": _latency_text(stats.pipeline_p50_ms, stats.latency_samples),
+            "pipeline_p95_ms": _latency_text(stats.pipeline_p95_ms, stats.latency_samples),
+            "pipeline_max_ms": _latency_text(stats.pipeline_max_ms, stats.latency_samples),
         }
         faults: dict[str, int] = {
             "chunks_dropped": stats.chunks_dropped,

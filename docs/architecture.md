@@ -167,8 +167,32 @@ So a 3000 ms window / 1000 ms hop config produces a chunk every second, each ~3.
 the leading edge of the *oldest* audio it contains. If perceived latency is too high, the lever
 is `window_ms` (bounded by how much context the model needs), not the transport.
 
-Instrument this: stamp `capture_time` on the chunk at emit and let the consumer record
-`now - capture_time` into a histogram surfaced in the GUI. Measure, don't assume.
+Instrument this: `AudioChunk.capture_time` is stamped at emit and the consumer records
+`now - capture_time` into a `LatencyTracker`, whose percentiles the GUI shows. Measure, don't
+assume.
+
+**Measured on real hardware** (live WASAPI mic, 16 kHz, 400 ms window / 200 ms hop):
+
+```
+pipeline p50   0.1 ms      <- consumer handoff: queue + thread scheduling
+pipeline p95   2.1 ms
+device latency 22.2 ms     <- WASAPI input buffer
+```
+
+So the transport really is a couple of milliseconds and the window length really is the whole
+story, as predicted above. Note what `capture_time` measures: the window has *already* been
+filled when it is stamped, so these figures are the handoff cost, not `window_ms + handoff`.
+
+> **Use `time.perf_counter()`, never `time.monotonic()`, for these timestamps.** On Windows
+> `time.monotonic()` is `GetTickCount64` with **15.625 ms** resolution. Measuring a
+> sub-millisecond handoff with it produced alternating 0 ms and 16 ms readings — noise
+> perfectly disguised as real latency spikes, and the first version of this instrumentation
+> reported exactly that. `perf_counter` is `QueryPerformanceCounter` (~100 ns) and is equally
+> monotonic. The two clocks have unrelated origins, so they must never be mixed.
+
+Percentiles, not averages: a mean hides the occasional stall a user actually notices. The
+tracker also keeps `worst_ever_ms` outside the rolling window, because a spike that scrolled
+out of view still happened.
 
 ### 3.4 Backpressure (`audio/sinks.py`)
 
@@ -310,5 +334,6 @@ becomes a problem.
    (545 tests passing; verified against real hardware at 16 kHz from a 48 kHz WASAPI device)
 5. ~~GUI: device panel, start/stop, meters, stats~~ — **done** (656 tests passing; verified
    driving a live microphone at 30.1 Hz with no thread outliving the window)
-6. Latency instrumentation + a stub consumer standing in for the ML stage
+6. ~~Latency instrumentation + a stub consumer standing in for the ML stage~~ — **done**
+   (690 tests passing; `LatencyTracker`, `StubInferenceSink`, percentiles in the stats panel)
 ```

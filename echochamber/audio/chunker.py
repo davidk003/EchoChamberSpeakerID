@@ -38,6 +38,7 @@ changed the setting.
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING, Callable
 
 from echochamber.audio.ringbuffer import OverrunError, RingBuffer
@@ -305,6 +306,13 @@ class WindowChunker:
                     seq,
                     cfg.sample_rate,
                     pending_discontinuity,
+                    # Stamped here, not in the sink: this is the moment the
+                    # window became complete, so everything a consumer adds
+                    # afterwards -- queueing, scheduling, inference -- shows up
+                    # in its measured latency rather than being invisible.
+                    # perf_counter, not monotonic: the latter is GetTickCount64
+                    # on Windows (15.6 ms), too coarse to see this handoff.
+                    time.perf_counter(),
                 )
                 pending_discontinuity = False
                 seq += 1

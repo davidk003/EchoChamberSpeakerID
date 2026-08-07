@@ -19,6 +19,7 @@ from echochamber.audio.devices import (
     find_input_device,
     list_input_devices,
 )
+from echochamber.audio.latency import LatencySummary, LatencyTracker
 from echochamber.audio.pipeline import (
     DRAIN_POLL_S,
     DRAIN_SETTLE_S,
@@ -40,6 +41,7 @@ from echochamber.audio.sources import (
     FileSource,
     SoundDeviceSource,
 )
+from echochamber.audio.stub_consumer import StubInferenceSink
 from echochamber.audio.types import AudioChunk, DropPolicy, StreamStats
 
 __all__ = [
@@ -58,12 +60,15 @@ __all__ = [
     "DeviceInfo",
     "DropPolicy",
     "FileSource",
+    "LatencySummary",
+    "LatencyTracker",
     "OverrunError",
     "QueueSink",
     "RingBuffer",
     "SoundDeviceSource",
     "SourceFactory",
     "StreamStats",
+    "StubInferenceSink",
     "TeeSink",
     "WavRecorderSink",
     "WindowChunker",
