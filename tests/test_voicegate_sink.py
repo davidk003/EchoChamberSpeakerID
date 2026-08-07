@@ -50,6 +50,7 @@ from echochamber.voicegate.recognizer import (
     float32_to_pcm16,
 )
 from echochamber.voicegate.sink import SnippetEvent, VoiceGateSink, VoiceGateStats
+from echochamber.voicegate.speaker import VerifyResult
 
 
 SR = 16_000
@@ -1361,6 +1362,234 @@ class TestClose:
         assert sink.snippets_written == 0
         assert recognizer.closed is True
         assert sink.error is None
+
+
+class _FakeVerifier:
+    """A scripted :class:`~echochamber.voicegate.speaker.SpeakerVerifier`.
+
+    Mirrors :class:`ScriptedRecognizer`'s role for the decoder seam: a test
+    decides the verdict in advance rather than driving a real embedder.
+    """
+
+    def __init__(
+        self,
+        matched: bool = True,
+        speaker: str | None = "alice",
+        score: float = 0.9,
+    ) -> None:
+        self.matched = matched
+        self.speaker = speaker
+        self.score = score
+        self.calls: list[tuple[np.ndarray, int]] = []
+        self.closed = False
+
+    def verify(self, samples: np.ndarray, sample_rate: int) -> VerifyResult:
+        self.calls.append((samples, sample_rate))
+        return VerifyResult(matched=self.matched, speaker=self.speaker, score=self.score)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _BoomVerifier:
+    """A verifier whose ``verify`` always raises, for the fail-closed path."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def verify(self, samples: np.ndarray, sample_rate: int) -> VerifyResult:
+        self.calls += 1
+        raise Boom("verifier died")
+
+    def close(self) -> None:
+        pass
+
+
+class TestSpeakerVerification:
+    """A configured verifier gates every new snippet; ``None`` lets everything through."""
+
+    def test_no_verifier_lets_every_phrase_through_unverified(
+        self, tmp_path: Path
+    ) -> None:
+        """The default: a gate built without speaker_verifier behaves as before."""
+        config = _config(tmp_path)
+        events: list = []
+        detections: list = []
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final())],
+            events,
+            on_detected=detections.append,
+        )
+
+        _feed(sink, 2)
+
+        assert sink.snippets_written == 1
+        assert len(detections) == 1
+        assert detections[0].speaker is None
+        assert detections[0].speaker_score == 0.0
+        stats = sink.snapshot()
+        assert stats.speaker_verified == 0
+        assert stats.speaker_rejected == 0
+
+    def test_a_matching_verifier_lets_the_phrase_through(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        events: list = []
+        detections: list = []
+        verifier = _FakeVerifier(matched=True, speaker="alice", score=0.87)
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final())],
+            events,
+            on_detected=detections.append,
+            speaker_verifier=verifier,
+        )
+
+        _feed(sink, 2)
+
+        assert sink.snippets_written == 1
+        assert len(events) == 1
+        assert len(detections) == 1
+        assert detections[0].speaker == "alice"
+        assert detections[0].speaker_score == pytest.approx(0.87)
+        assert len(verifier.calls) == 1
+        called_samples, called_rate = verifier.calls[0]
+        assert np.array_equal(called_samples, _chunk(0).samples)
+        assert called_rate == SR
+
+        stats = sink.snapshot()
+        assert stats.speaker_verified == 1
+        assert stats.speaker_rejected == 0
+        assert stats.last_speaker == "alice"
+        assert stats.last_speaker_score == pytest.approx(0.87)
+
+    def test_a_rejecting_verifier_suppresses_the_phrase_entirely(
+        self, tmp_path: Path
+    ) -> None:
+        """Fail closed: no snippet, no on_snippet, no on_detected -- as if unheard."""
+        config = _config(tmp_path)
+        events: list = []
+        detections: list = []
+        verifier = _FakeVerifier(matched=False, speaker=None, score=0.0)
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final())],
+            events,
+            on_detected=detections.append,
+            speaker_verifier=verifier,
+        )
+
+        _feed(sink, 2)
+
+        assert sink.snippets_written == 0
+        assert sink.recording is False
+        assert events == []
+        assert detections == []
+        assert _wavs(config) == []
+
+        stats = sink.snapshot()
+        assert stats.phrases_detected == 1, "the phrase was still heard by the decoder"
+        assert stats.speaker_rejected == 1
+        assert stats.speaker_verified == 0
+
+    def test_a_raising_verifier_fails_closed(self, tmp_path: Path) -> None:
+        """A dead embedder must suppress the phrase, not let it through."""
+        config = _config(tmp_path)
+        events: list = []
+        detections: list = []
+        verifier = _BoomVerifier()
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final())],
+            events,
+            on_detected=detections.append,
+            speaker_verifier=verifier,
+        )
+
+        _feed(sink, 2)
+
+        assert sink.snippets_written == 0
+        assert events == []
+        assert detections == []
+        assert verifier.calls == 1
+        assert sink.error is not None
+        assert "speaker verification failed" in sink.error
+
+        stats = sink.snapshot()
+        assert stats.speaker_rejected == 1
+        assert stats.speaker_verified == 0
+
+    def test_extending_an_open_snippet_does_not_re_verify(self, tmp_path: Path) -> None:
+        """One utterance is verified once; a repeated phrase just extends it."""
+        config = _config(tmp_path, pre_roll_ms=0, post_roll_ms=2000, cooldown_ms=0)
+        events: list = []
+        detections: list = []
+        verifier = _FakeVerifier(matched=True, speaker="alice", score=0.9)
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final()), (_bytes_after(1), _final())],
+            events,
+            on_detected=detections.append,
+            speaker_verifier=verifier,
+        )
+
+        _feed(sink, 3)
+
+        assert len(verifier.calls) == 1, "the second match must extend, not re-verify"
+        assert len(detections) == 2
+        assert detections[0].extended is False
+        assert detections[1].extended is True
+        assert detections[1].speaker is None, (
+            "an extension carries no fresh verification of its own"
+        )
+
+    def test_rejecting_a_match_leaves_a_later_match_free_to_open_a_snippet(
+        self, tmp_path: Path
+    ) -> None:
+        """A rejected phrase must not wedge the gate: the next attempt tries again."""
+        config = _config(tmp_path, cooldown_ms=0)
+        events: list = []
+        verifier = _FakeVerifier(matched=False)
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final()), (_bytes_after(2), _final())],
+            events,
+            speaker_verifier=verifier,
+        )
+
+        _feed(sink, 2)
+        assert sink.snippets_written == 0
+        assert len(verifier.calls) == 1, "test setup: only the first match fired yet"
+
+        verifier.matched = True
+        verifier.speaker = "alice"
+        sink.on_chunk(_chunk(2))
+
+        assert len(verifier.calls) == 2
+        assert sink.snippets_written == 0, "still open; post-roll has not elapsed yet"
+        assert sink.recording is True
+
+    def test_close_closes_the_speaker_verifier(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        verifier = _FakeVerifier()
+        sink, _ = _make_sink(config, speaker_verifier=verifier)
+
+        sink.close()
+
+        assert verifier.closed is True
+
+    def test_close_is_idempotent_with_a_verifier_configured(
+        self, tmp_path: Path
+    ) -> None:
+        config = _config(tmp_path)
+        verifier = _FakeVerifier()
+        sink, _ = _make_sink(config, speaker_verifier=verifier)
+
+        sink.close()
+        sink.close()  # must not raise, must not double-close the verifier oddly
+
+        assert verifier.closed is True
+
 
     def test_on_chunk_after_close_does_nothing(self, tmp_path: Path) -> None:
         """A late chunk during shutdown must not reopen the gate."""

@@ -513,6 +513,35 @@ class TestPayload:
         assert snippet(duration_s=duration_s).to_payload()["duration_s"] == expected
 
 
+class TestSpeakerFields:
+    """speaker/speaker_score are omitted unless a verifier actually ran."""
+
+    def test_speaker_is_omitted_by_default(self) -> None:
+        """The common case: no speaker verifier configured at all."""
+        assert "speaker" not in detected().to_payload()
+        assert "speaker_score" not in detected().to_payload()
+
+    def test_speaker_is_included_on_a_detected_event_when_set(self) -> None:
+        payload = detected(speaker="alice", speaker_score=0.87).to_payload()
+        assert payload["speaker"] == "alice"
+        assert payload["speaker_score"] == 0.87
+
+    def test_speaker_is_included_on_a_snippet_event_when_set(self) -> None:
+        payload = snippet(speaker="alice", speaker_score=0.87).to_payload()
+        assert payload["speaker"] == "alice"
+        assert payload["speaker_score"] == 0.87
+
+    def test_speaker_score_is_rounded_to_four_places(self) -> None:
+        payload = detected(speaker="alice", speaker_score=0.123456789).to_payload()
+        assert payload["speaker_score"] == 0.1235
+
+    def test_speaker_none_omits_both_fields_even_with_a_nonzero_score(self) -> None:
+        """A score without a name would be meaningless; both travel together."""
+        payload = detected(speaker=None, speaker_score=0.5).to_payload()
+        assert "speaker" not in payload
+        assert "speaker_score" not in payload
+
+
 class TestToJson:
     """to_json is to_payload plus json.dumps, and must stay that way."""
 

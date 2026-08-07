@@ -94,6 +94,8 @@ class NotifyRelay:
                 sample_rate=self._sample_rate,
                 timestamp=event.timestamp,
                 start_frame=event.start_frame,
+                speaker=event.speaker,
+                speaker_score=event.speaker_score,
             )
         )
 

@@ -220,6 +220,13 @@ class NotifyEvent:
         audio: Raw WAV bytes when the notifier was told to include them, else
             ``None``.  Held as bytes and encoded only at serialisation, so an
             event that is dropped from the queue never pays for base64.
+        speaker: Name of the enrolled speaker the phrase was verified
+            against, or ``None`` when speaker verification is not configured.
+            A phrase that failed verification never reaches this event at
+            all -- see :meth:`echochamber.voicegate.sink.VoiceGateSink._on_match`,
+            which suppresses it before ``on_detected`` is ever called.
+        speaker_score: Cosine similarity of ``speaker``'s match, ``0.0`` when
+            ``speaker`` is ``None``.
     """
 
     kind: EventKind
@@ -234,6 +241,8 @@ class NotifyEvent:
     duration_s: float = 0.0
     truncated: bool = False
     audio: bytes | None = None
+    speaker: str | None = None
+    speaker_score: float = 0.0
 
     def to_payload(self) -> dict[str, Any]:
         """Render this event as the JSON object that goes on the wire.
@@ -242,7 +251,8 @@ class NotifyEvent:
             A plain dictionary.  ``DETECTED`` events omit every snippet field
             rather than sending zeros, because a consumer cannot tell a real
             ``duration_s`` of ``0.0`` from a placeholder one, and a missing key
-            is unambiguous.
+            is unambiguous.  The same rule applies to ``speaker``: omitted
+            entirely, on either event kind, when no verifier was configured.
         """
         payload: dict[str, Any] = {
             "type": self.kind.value,
@@ -252,6 +262,9 @@ class NotifyEvent:
             "sample_rate": self.sample_rate,
             "timestamp": self.timestamp,
         }
+        if self.speaker is not None:
+            payload["speaker"] = self.speaker
+            payload["speaker_score"] = round(self.speaker_score, 4)
         if self.kind is EventKind.SNIPPET:
             payload.update(
                 {

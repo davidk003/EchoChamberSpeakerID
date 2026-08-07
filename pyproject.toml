@@ -43,6 +43,17 @@ voice-gate = [
 notify = [
     "websocket-client>=1.7",
 ]
+# There is no optional-dependency entry for speaker verification: the only
+# speakerid module the main application imports directly,
+# echochamber/speakerid/qnn_subprocess.py, needs nothing beyond numpy, and
+# scripts/enroll_speaker.py needs nothing beyond sounddevice -- both already
+# core dependencies above. Everything else the backend needs (torch,
+# torchaudio, onnxruntime, onnxruntime-qnn) lives in the two venvs
+# scripts/setup_speakerid_qnn.py builds, never in this project's own
+# environment, for the same win_arm64 reason vosk lives in .venv-vosk rather
+# than here: torch has no ARM64 wheel, and onnxruntime-qnn's HTP backend only
+# loads inside a *native* ARM64 process, which the app's own interpreter
+# already is.
 
 [project.scripts]
 echochamber = "echochamber.app:main"

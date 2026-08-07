@@ -50,6 +50,9 @@ from echochamber.audio.sinks import ChunkSink, TeeSink
 from echochamber.audio.sources.sounddevice_source import SoundDeviceSource
 from echochamber.audio.types import AudioChunk, StreamStats
 from echochamber.config import AudioConfig
+from echochamber.speakerid.backends import VerifierChoice, build_verifier
+from echochamber.speakerid.backends import describe_backend as describe_speaker_backend
+from echochamber.speakerid.config import SpeakerIdConfig, autodetect_speaker_id_config
 from echochamber.ui.meters import PeakHold
 from echochamber.voicegate.backends import (
     RecognizerChoice,
@@ -158,6 +161,28 @@ class UiStats:
         gate_error: Whatever the gate last failed at, or ``None``.  A gate that
             has stopped producing snippets is either hearing nothing or broken,
             and this is how a display tells those apart.
+        speaker_id_backend: Which speaker-verification backend is in use --
+            ``"qnn"`` or ``"none"``.  ``"none"`` while speaker verification is
+            configured on means it failed to start, and ``speaker_id_error``
+            says why -- mirrors ``gate_backend``'s own contract.
+        speaker_verified: Phrases that matched an enrolled speaker.
+        speaker_rejected: Phrases suppressed because no enrolled speaker
+            matched.  Climbing while ``gate_detected`` also climbs but
+            ``gate_snippets`` does not means the gate is hearing wake phrases
+            from someone who isn't enrolled.
+        speaker_last_name: Most recently verified speaker; empty before the
+            first attempt or when no verifier is configured.
+        speaker_last_score: Cosine similarity of the most recent verification
+            attempt, matched or not.
+        speaker_id_error: The gate's most recently swallowed failure, or
+            ``None``.  Shares :attr:`gate_error`'s underlying counter --
+            :class:`~echochamber.voicegate.sink.VoiceGateSink` records
+            whichever of recognition, speaker verification, snippet I/O or a
+            callback failed most recently in one field, since only one gate
+            runs at a time. A speaker-verification failure and a decoder
+            failure are told apart by which of :attr:`speaker_rejected` and
+            :attr:`gate_detected` moved, not by which of these two fields is
+            set.
         notify_enabled: Whether wake-phrase notifications are configured on.
         notify_connected: Whether the notifier currently holds an open socket.
         notify_sent: Events written to the socket.
@@ -193,6 +218,12 @@ class UiStats:
     gate_last_phrase: str = ""
     gate_last_path: str | None = None
     gate_error: str | None = None
+    speaker_id_backend: str = "none"
+    speaker_verified: int = 0
+    speaker_rejected: int = 0
+    speaker_last_name: str = ""
+    speaker_last_score: float = 0.0
+    speaker_id_error: str | None = None
     notify_enabled: bool = False
     notify_connected: bool = False
     notify_sent: int = 0
@@ -410,6 +441,8 @@ class CaptureController(QObject):
         recognizer_builder: Callable[..., RecognizerChoice] | None = None,
         notify: NotifyConfig | None = None,
         transport_builder: Callable[..., tuple[Transport, str | None]] | None = None,
+        speaker_id: SpeakerIdConfig | None = None,
+        speaker_verifier_builder: Callable[..., VerifierChoice] | None = None,
     ) -> None:
         """Create a stopped controller.  Nothing is enumerated or opened yet.
 
@@ -458,6 +491,20 @@ class CaptureController(QObject):
                 injects a
                 :class:`~echochamber.voicegate.notify.RecordingTransport` and
                 never touches a network.
+            speaker_id: Speaker-verification configuration.  When ``None``, a
+                default :class:`~echochamber.speakerid.config.SpeakerIdConfig`
+                is built with paths autodetected from what
+                :mod:`scripts.setup_speakerid_qnn` and
+                :mod:`scripts.export_speakerid_qnn` left on disk (see
+                :func:`~echochamber.speakerid.config.autodetect_speaker_id_config`),
+                mirroring ``voice_gate``'s own default exactly.
+            speaker_verifier_builder: Callable returning a
+                :class:`~echochamber.speakerid.backends.VerifierChoice`, called
+                with ``(config)`` at :meth:`start`.  Defaults to
+                :func:`~echochamber.speakerid.backends.build_verifier`.  The
+                seam that lets a test drive the gate with a scripted verifier
+                and no QNN subprocess chain -- the same role
+                ``recognizer_builder`` plays for Vosk.
         """
         super().__init__(parent)
 
@@ -480,6 +527,13 @@ class CaptureController(QObject):
         self._transport_builder: Callable[..., tuple[Transport, str | None]] = (
             build_transport if transport_builder is None else transport_builder
         )
+        self._speaker_id_config: SpeakerIdConfig = (
+            autodetect_speaker_id_config() if speaker_id is None else speaker_id
+        )
+        self._speaker_verifier_builder: Callable[..., VerifierChoice] = (
+            build_verifier if speaker_verifier_builder is None else speaker_verifier_builder
+        )
+        self._speaker_id_backend: str = "none"
         self._gate_sink: VoiceGateSink | None = None
         self._gate_backend: str = "none"
         self._notifier: WebSocketNotifier | None = None
@@ -579,6 +633,11 @@ class CaptureController(QObject):
     def notifier(self) -> WebSocketNotifier | None:
         """The live notifier, or ``None`` when stopped or notifications are off."""
         return self._notifier
+
+    @property
+    def speaker_id_config(self) -> SpeakerIdConfig:
+        """The speaker-verification configuration the next :meth:`start` will use."""
+        return self._speaker_id_config
 
     @property
     def poll_timer(self) -> QTimer:
@@ -884,6 +943,41 @@ class CaptureController(QObject):
             return False
         return True
 
+    def set_speaker_id(self, config: SpeakerIdConfig) -> bool:
+        """Adopt a new speaker-verification configuration.
+
+        **Takes effect on the next start, never live** -- for the same reason
+        :meth:`set_voice_gate` doesn't apply live: the QNN subprocess chain is
+        started once with a fixed configuration, and swapping it under a
+        running gate would mean tearing down and relaunching that chain
+        mid-capture.
+
+        Args:
+            config: The new speaker-verification configuration.
+
+        Returns:
+            ``True``.  Never raises.  A ``None`` is rejected with ``False``
+            and a reported error rather than replacing the configuration with
+            something unusable.
+        """
+        if config is None:
+            self.error_occurred.emit("speaker-id configuration must not be None")
+            return False
+        self._speaker_id_config = config
+        return True
+
+    def set_speaker_id_enabled(self, enabled: bool) -> bool:
+        """Switch speaker verification on or off for the next run.
+
+        Args:
+            enabled: Whether verification should run.
+
+        Returns:
+            ``True``.  Never raises.
+        """
+        self._speaker_id_config = self._speaker_id_config.with_enabled(enabled)
+        return True
+
     # -- the tick ----------------------------------------------------------
 
     def poll(self) -> UiStats:
@@ -979,6 +1073,12 @@ class CaptureController(QObject):
             gate_last_phrase=gate.last_phrase,
             gate_last_path=gate.last_snippet_path,
             gate_error=gate.error,
+            speaker_id_backend=self._speaker_id_backend,
+            speaker_verified=gate.speaker_verified,
+            speaker_rejected=gate.speaker_rejected,
+            speaker_last_name=gate.last_speaker,
+            speaker_last_score=gate.last_speaker_score,
+            speaker_id_error=gate.error,
             notify_enabled=self._notify_config.enabled,
             notify_connected=notify.connected,
             notify_sent=notify.sent,
@@ -1053,6 +1153,7 @@ class CaptureController(QObject):
         gate_config = self._voice_gate_config
         if not gate_config.enabled:
             self._gate_backend = "none"
+            self._speaker_id_backend = "none"
             return None, ""
 
         choice = self._recognizer_builder(gate_config, self._config.sample_rate)
@@ -1060,17 +1161,51 @@ class CaptureController(QObject):
         if not choice.ok:
             # build_recognizer already fell back to a NullRecognizer and closed
             # anything half-built, so there is nothing to clean up here.
+            self._speaker_id_backend = "none"
             return None, describe_backend(choice)
 
         relay, note = self._build_notifier()
+        speaker_choice, speaker_note = self._build_speaker_verifier()
+        # Both notes can be non-empty at once (gate started, notifier failed,
+        # verifier failed); start() only shows one per attempt, so the two are
+        # joined rather than one silently overwriting the other.
+        combined_note = "; ".join(part for part in (note, speaker_note) if part)
         sink = VoiceGateSink(
             gate_config,
             self._config.sample_rate,
             recognizer=choice.recognizer,
             on_snippet=None if relay is None else relay.on_snippet,
             on_detected=None if relay is None else relay.on_detected,
+            speaker_verifier=None if speaker_choice is None else speaker_choice.verifier,
         )
-        return sink, note
+        return sink, combined_note
+
+    def _build_speaker_verifier(self) -> tuple[VerifierChoice | None, str]:
+        """Build the speaker verifier for this run, if verification is enabled.
+
+        A verifier that refuses to start is **not** a reason to refuse to
+        capture, for exactly the same reason a broken recogniser isn't: see
+        :meth:`_build_gate`.  Every phrase then passes through unverified
+        rather than the gate silently going deaf, since
+        :class:`~echochamber.voicegate.sink.VoiceGateSink` treats "no verifier
+        configured" as "let it through" -- fail-closed applies only once a
+        verifier is actually running.
+
+        Returns:
+            ``(choice, note)``.  ``choice`` is ``None`` when verification is
+            disabled; ``note`` is a message to show the user, empty when
+            there is nothing worth saying.
+        """
+        speaker_config = self._speaker_id_config
+        if not speaker_config.enabled:
+            self._speaker_id_backend = "none"
+            return None, ""
+
+        choice = self._speaker_verifier_builder(speaker_config)
+        self._speaker_id_backend = choice.backend
+        if not choice.ok:
+            return None, describe_speaker_backend(choice)
+        return choice, ""
 
     def _build_notifier(self) -> tuple[NotifyRelay | None, str]:
         """Start the notifier for this run, if notifications are enabled.

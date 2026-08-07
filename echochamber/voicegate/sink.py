@@ -73,6 +73,7 @@ from echochamber.voicegate.snippets import (
     SnippetWriter,
     snippet_filename,
 )
+from echochamber.voicegate.speaker import SpeakerVerifier, VerifyResult
 
 __all__ = ["DetectionEvent", "SnippetEvent", "VoiceGateSink", "VoiceGateStats"]
 
@@ -106,6 +107,15 @@ class DetectionEvent:
         timestamp: UNIX time the detection was announced.
         extended: ``True`` when this detection landed inside an already-open
             snippet and pushed its post-roll out, rather than opening a file.
+        speaker: Name of the enrolled speaker the phrase was verified against,
+            or ``None`` when no :class:`~echochamber.voicegate.speaker.SpeakerVerifier`
+            was configured.  A phrase spoken by nobody enrolled never reaches
+            this dataclass at all -- see
+            :meth:`VoiceGateSink._verify_speaker`, which suppresses the
+            snippet and this event together rather than announcing a
+            rejection.
+        speaker_score: Cosine similarity of the match named in ``speaker``,
+            ``0.0`` when ``speaker`` is ``None``.
     """
 
     phrase: str
@@ -114,12 +124,14 @@ class DetectionEvent:
     start_frame: int
     timestamp: float
     extended: bool = False
+    speaker: str | None = None
+    speaker_score: float = 0.0
 
     def __repr__(self) -> str:
         """Return a debugging representation naming the phrase and snippet."""
         return (
             f"{type(self).__name__}(phrase={self.phrase!r}, seq={self.seq}, "
-            f"extended={self.extended})"
+            f"extended={self.extended}, speaker={self.speaker!r})"
         )
 
 
@@ -203,6 +215,20 @@ class VoiceGateStats:
         last_phrase: Most recently matched phrase, empty before the first.
         last_snippet_path: Path of the most recently completed snippet, or
             ``None`` before the first.
+        speaker_verified: Phrases that matched an enrolled speaker and were
+            let through to a snippet.  ``0`` whenever no
+            :class:`~echochamber.voicegate.speaker.SpeakerVerifier` is
+            configured, since every phrase is then let through unverified and
+            never counted here.
+        speaker_rejected: Phrases that opened a snippet's worth of match but
+            were suppressed because the speaker verifier found no enrolled
+            match -- including "nothing enrolled" and a verifier failure,
+            both of which fail closed; see
+            :meth:`VoiceGateSink._verify_speaker`.
+        last_speaker: Name of the most recently verified speaker, empty before
+            the first match or when no verifier is configured.
+        last_speaker_score: Cosine similarity of the most recent verification
+            attempt, matched or not, ``0.0`` before the first.
         error: Most recent failure the gate swallowed, or ``None``.  A gate
             that is not gating explains itself here.
     """
@@ -217,6 +243,10 @@ class VoiceGateStats:
     clips_fallback: int = 0
     last_phrase: str = ""
     last_snippet_path: str | None = None
+    speaker_verified: int = 0
+    speaker_rejected: int = 0
+    last_speaker: str = ""
+    last_speaker_score: float = 0.0
     error: str | None = None
 
     def __repr__(self) -> str:
@@ -276,6 +306,8 @@ class VoiceGateSink:
         "_post_roll_left",
         "_frames_since_snippet",
         "_closed",
+        "_speaker_verifier",
+        "_on_verification",
         "_lock",
         "_frames_processed",
         "_phrases_detected",
@@ -287,6 +319,10 @@ class VoiceGateSink:
         "_last_snippet_path",
         "_clips_located",
         "_clips_fallback",
+        "_speaker_verified",
+        "_speaker_rejected",
+        "_last_speaker",
+        "_last_speaker_score",
         "_error",
     )
 
@@ -298,6 +334,8 @@ class VoiceGateSink:
         on_snippet: Callable[[SnippetEvent], None] | None = None,
         clock: Callable[[], float] | None = None,
         on_detected: Callable[[DetectionEvent], None] | None = None,
+        speaker_verifier: SpeakerVerifier | None = None,
+        on_verification: Callable[[bool], None] | None = None,
     ) -> None:
         """Wire a gate to a recogniser.
 
@@ -324,6 +362,22 @@ class VoiceGateSink:
                 all for a suppressed duplicate.  Runs on the consumer thread, so
                 it must not block; an exception it raises is recorded in
                 :attr:`error` and otherwise ignored.
+            speaker_verifier: When given, every phrase that would otherwise
+                open a new snippet is checked against it first -- see
+                :meth:`_verify_speaker`.  A phrase spoken by nobody it
+                recognises is suppressed entirely: no snippet, no
+                :class:`DetectionEvent`, exactly as if the phrase had not
+                matched.  ``None`` -- the default -- lets every phrase through
+                unverified, which is what makes a gate built without one
+                behave exactly as it did before this parameter existed.
+            on_verification: Called with ``True`` when a phrase's speaker
+                matched, ``False`` when checked and not matched. Never
+                called when ``speaker_verifier`` is ``None``, since there is
+                then nothing to report -- a gate with no verifier configured
+                stays silent on this hook exactly as it lets every phrase
+                through unverified. Runs on the consumer thread, so it must
+                not block; an exception it raises is recorded in
+                :attr:`error` and otherwise ignored.
 
         Raises:
             ValueError: If ``sample_rate`` is not positive.
@@ -340,6 +394,8 @@ class VoiceGateSink:
         self._on_snippet: Callable[[SnippetEvent], None] | None = on_snippet
         self._on_detected: Callable[[DetectionEvent], None] | None = on_detected
         self._clock: Callable[[], float] = time.time if clock is None else clock
+        self._speaker_verifier: SpeakerVerifier | None = speaker_verifier
+        self._on_verification: Callable[[bool], None] | None = on_verification
 
         # The config is frozen, so normalising the phrases once here is safe
         # and keeps that work off the per-result path.
@@ -388,6 +444,10 @@ class VoiceGateSink:
         self._last_snippet_path: str | None = None
         self._clips_located: int = 0
         self._clips_fallback: int = 0
+        self._speaker_verified: int = 0
+        self._speaker_rejected: int = 0
+        self._last_speaker: str = ""
+        self._last_speaker_score: float = 0.0
         self._error: str | None = None
 
     @property
@@ -466,6 +526,30 @@ class VoiceGateSink:
             return self._last_snippet_path
 
     @property
+    def speaker_verified(self) -> int:
+        """Phrases that matched an enrolled speaker and were let through."""
+        with self._lock:
+            return self._speaker_verified
+
+    @property
+    def speaker_rejected(self) -> int:
+        """Phrases suppressed because the speaker verifier found no match."""
+        with self._lock:
+            return self._speaker_rejected
+
+    @property
+    def last_speaker(self) -> str:
+        """Most recently verified speaker; empty before the first attempt."""
+        with self._lock:
+            return self._last_speaker
+
+    @property
+    def last_speaker_score(self) -> float:
+        """Cosine similarity of the most recent verification attempt."""
+        with self._lock:
+            return self._last_speaker_score
+
+    @property
     def error(self) -> str | None:
         """Most recent swallowed failure, or ``None`` if nothing has failed.
 
@@ -508,6 +592,10 @@ class VoiceGateSink:
                 clips_fallback=self._clips_fallback,
                 last_phrase=self._last_phrase,
                 last_snippet_path=self._last_snippet_path,
+                speaker_verified=self._speaker_verified,
+                speaker_rejected=self._speaker_rejected,
+                last_speaker=self._last_speaker,
+                last_speaker_score=self._last_speaker_score,
                 error=self._error,
             )
 
@@ -554,6 +642,11 @@ class VoiceGateSink:
             self._recognizer.close()
         except Exception as exc:  # noqa: BLE001 - shutdown must complete
             self._fail("closing the recogniser", exc)
+        if self._speaker_verifier is not None:
+            try:
+                self._speaker_verifier.close()
+            except Exception as exc:  # noqa: BLE001 - shutdown must complete
+                self._fail("closing the speaker verifier", exc)
 
     def _process(self, chunk: AudioChunk) -> None:
         """Run the per-chunk algorithm.  Called only from :meth:`on_chunk`.
@@ -622,10 +715,14 @@ class VoiceGateSink:
                 continue
             found = match_phrase(result.text, self._phrases)
             if found is not None:
-                self._on_match(found, result.text, result)
+                self._on_match(found, result.text, result, chunk)
 
     def _on_match(
-        self, found: PhraseMatch, text: str, recognition: Recognition
+        self,
+        found: PhraseMatch,
+        text: str,
+        recognition: Recognition,
+        chunk: AudioChunk,
     ) -> None:
         """Open, extend or suppress a snippet for one matched phrase.
 
@@ -634,6 +731,11 @@ class VoiceGateSink:
             text: The full recognised text, stored on the resulting event.
             recognition: The result the phrase came from, carrying the per-word
                 timings that let the snippet be cut to the phrase itself.
+            chunk: The window this match was recognised in.  Handed to
+                :meth:`_verify_speaker` as the audio to check, since it is the
+                only sample data available at the moment a phrase is heard --
+                there is no separate "the phrase's own audio" until
+                :meth:`_open_snippet`/:meth:`_locate_phrase` has cut one out.
         """
         with self._lock:
             self._phrases_detected += 1
@@ -653,15 +755,75 @@ class VoiceGateSink:
             # Extend rather than open a second file: repeated wake phrases in
             # one breath are one utterance, and splitting them mid-sentence
             # would give two files that each cut the other's audio in half.
+            # Not re-verified: the speaker was already checked when this
+            # snippet opened, and re-running the model on every repeat of the
+            # phrase would buy nothing but latency.
             self._post_roll_left = self._post_roll_frames
             self._snippet_text = text
             self._emit_detected(found, text, extended=True)
             return
 
+        verified = self._verify_speaker(chunk)
+        if verified is not None:
+            # Reported for both outcomes, not just a match: a listener (e.g.
+            # an ADB hotword-blocking trigger) needs to hear "not this
+            # speaker" exactly as much as "this speaker", since blocking on
+            # rejection and clearing on a match are the two halves of one
+            # policy. Only skipped when there is no verifier at all, since
+            # then there is no verification result to report.
+            self._emit_verification(verified.matched)
+        if verified is not None and not verified.matched:
+            # Fail closed: no verifier configured is the only way a phrase
+            # gets through unchecked. A verifier that ran and found no
+            # enrolled match -- including "nothing enrolled yet" -- suppresses
+            # the phrase exactly as if it had never matched: no snippet, no
+            # DetectionEvent, nothing for a listener downstream to react to.
+            return
+
         self._open_snippet(found, text, recognition)
         # After the snippet is open, so the event carries the seq of the file
         # this detection actually belongs to rather than the previous one's.
-        self._emit_detected(found, text, extended=False)
+        speaker = verified.speaker if verified is not None else None
+        speaker_score = verified.score if verified is not None else 0.0
+        self._emit_detected(
+            found, text, extended=False, speaker=speaker, speaker_score=speaker_score
+        )
+
+    def _verify_speaker(self, chunk: AudioChunk) -> VerifyResult | None:
+        """Check ``chunk`` against every enrolled speaker, if a verifier is configured.
+
+        Never raises: a verifier failure -- a dead worker process, a clip too
+        short to embed -- degrades to "not matched" rather than reaching
+        :meth:`on_chunk`'s caller, exactly like :meth:`_recognize` degrading a
+        decoder fault to "heard nothing". This is what makes the gate
+        fail-closed rather than fail-open: an exception here must suppress
+        the phrase, not let it through.
+
+        Args:
+            chunk: The window the phrase was recognised in.
+
+        Returns:
+            ``None`` when no verifier is configured, meaning the caller should
+            let the phrase through unverified. Otherwise the
+            :class:`~echochamber.voicegate.speaker.VerifyResult`, whose
+            ``matched`` the caller checks.
+        """
+        verifier = self._speaker_verifier
+        if verifier is None:
+            return None
+        try:
+            result = verifier.verify(chunk.samples, chunk.sample_rate)
+        except Exception as exc:  # noqa: BLE001 - must fail closed, not kill the consumer
+            self._fail("speaker verification", exc)
+            result = VerifyResult(matched=False, speaker=None, score=0.0)
+        with self._lock:
+            self._last_speaker = result.speaker or ""
+            self._last_speaker_score = result.score
+            if result.matched:
+                self._speaker_verified += 1
+            else:
+                self._speaker_rejected += 1
+        return result
 
     def _locate_phrase(
         self, found: PhraseMatch, recognition: Recognition
@@ -928,7 +1090,12 @@ class VoiceGateSink:
             self._fail("resetting the recogniser", exc)
 
     def _emit_detected(
-        self, found: PhraseMatch, text: str, extended: bool
+        self,
+        found: PhraseMatch,
+        text: str,
+        extended: bool,
+        speaker: str | None = None,
+        speaker_score: float = 0.0,
     ) -> None:
         """Announce a detection, swallowing anything the callback raises.
 
@@ -937,6 +1104,10 @@ class VoiceGateSink:
             text: The full recognised text.
             extended: Whether this detection extended an open snippet rather
                 than opening one.
+            speaker: Name of the verified speaker, or ``None`` when no
+                verifier is configured (or this call extends an already-open
+                snippet, which is never re-verified; see :meth:`_on_match`).
+            speaker_score: Cosine similarity of ``speaker``'s match.
         """
         callback = self._on_detected
         if callback is None:
@@ -950,10 +1121,27 @@ class VoiceGateSink:
                     start_frame=self._next_expected or 0,
                     timestamp=self._clock(),
                     extended=extended,
+                    speaker=speaker,
+                    speaker_score=speaker_score,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - a callback must not kill
             self._fail("the detection callback", exc)
+
+    def _emit_verification(self, matched: bool) -> None:
+        """Report a speaker-verification outcome, swallowing anything the callback raises.
+
+        Args:
+            matched: ``True`` if the phrase's speaker was recognised,
+                ``False`` if a verifier ran and found no match.
+        """
+        callback = self._on_verification
+        if callback is None:
+            return
+        try:
+            callback(matched)
+        except Exception as exc:  # noqa: BLE001 - a callback must not kill
+            self._fail("the verification callback", exc)
 
     def _emit(self, event: SnippetEvent) -> None:
         """Hand ``event`` to the callback, swallowing anything it raises.

@@ -378,6 +378,25 @@ class TestOnDetected:
         relay, _ = make_relay()
         assert relay.on_detected(detection()) is None
 
+    def test_speaker_and_score_cross_over(self) -> None:
+        """A verified detection carries its speaker through to the wire."""
+        relay, notifier = make_relay()
+        relay.on_detected(detection(speaker="alice", speaker_score=0.87))
+
+        event = notifier.events[0]
+        assert event.speaker == "alice"
+        assert event.speaker_score == pytest.approx(0.87)
+
+    def test_no_verifier_forwards_speaker_as_none(self) -> None:
+        """The default DetectionEvent carries no speaker; the relay must not invent one."""
+        relay, notifier = make_relay()
+        relay.on_detected(detection())
+
+        event = notifier.events[0]
+        assert event.speaker is None
+        assert event.speaker_score == 0.0
+        assert "speaker" not in event.to_payload()
+
 
 # ==========================================================================
 # on_snippet

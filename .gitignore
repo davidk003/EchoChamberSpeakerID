@@ -18,6 +18,13 @@ env/
 # emulated x64 interpreter, so its wheels are the wrong architecture for the
 # native one.
 .venv-vosk/
+# The two venvs for the QNN speaker-verification backend, created by
+# scripts/setup_speakerid_qnn.py: an x64 one (feature extraction, has torch)
+# and a native ARM64 one (Hexagon NPU inference via onnxruntime-qnn). Kept
+# separate from the main environment for the same architecture reasons as
+# .venv-vosk above.
+.venv-speakerid-x64/
+.venv-speakerid-arm64/
 
 # Test / tooling caches
 .pytest_cache/
@@ -37,8 +44,14 @@ recordings/
 snippets/
 
 # Speech models. vosk-model-small-en-us-0.15 is ~40 MB unpacked and is
-# fetched by scripts/setup_voice_gate.py -- never committed.
+# fetched by scripts/setup_voice_gate.py -- never committed. Also covers
+# models/speakerid/campplus_qnn.onnx, exported by
+# scripts/export_speakerid_qnn.py.
 models/
+
+# Enrolled speaker embeddings (scripts/enroll_speaker.py output). Biometric
+# data specific to whoever ran enrollment on this machine -- never committed.
+enrolled_speakers.json
 
 # Editor / OS
 .vscode/

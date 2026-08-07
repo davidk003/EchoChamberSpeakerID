@@ -33,6 +33,10 @@ import pytest
 from echochamber.audio.sources.file_source import FileSource
 from echochamber.audio.types import DropPolicy, StreamStats
 from echochamber.config import AudioConfig
+from echochamber.speakerid.backends import VerifierChoice
+from echochamber.speakerid.config import SpeakerIdConfig
+from echochamber.speakerid.enrollment import BACKEND_QNN, enroll
+from echochamber.speakerid.verifier import EnrolledSpeakerVerifier
 from echochamber.ui.controller import CaptureController, CaptureState, UiStats
 from echochamber.ui.voice_gate_panel import (
     PHRASE_SEPARATOR,
@@ -141,6 +145,43 @@ def _scripted_builder(script, backend: str = "in-process"):
 
     def builder(config: VoiceGateConfig, sample_rate: int) -> RecognizerChoice:
         return RecognizerChoice(ScriptedRecognizer(list(script)), backend)
+
+    return builder
+
+
+class _FakeVerifier:
+    """A scripted speaker verifier for controller-level wiring tests."""
+
+    def __init__(self, matched: bool, speaker: str | None = "alice", score: float = 0.9) -> None:
+        self.matched = matched
+        self.speaker = speaker
+        self.score = score
+        self.calls = 0
+        self.closed = False
+
+    def verify(self, samples, sample_rate):
+        from echochamber.voicegate.speaker import VerifyResult
+
+        self.calls += 1
+        return VerifyResult(matched=self.matched, speaker=self.speaker, score=self.score)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _scripted_verifier_builder(verifier, backend: str = "qnn"):
+    """Build a ``speaker_verifier_builder`` returning a pre-built verifier.
+
+    Args:
+        verifier: The verifier to hand back, or ``None``.
+        backend: Backend name to report.
+
+    Returns:
+        A callable matching the controller's expected signature.
+    """
+
+    def builder(config: SpeakerIdConfig) -> VerifierChoice:
+        return VerifierChoice(verifier, backend)
 
     return builder
 
@@ -398,6 +439,133 @@ class TestControllerGateWiring:
         """A None config is refused rather than replacing a working one."""
         controller = CaptureController(voice_gate=VoiceGateConfig())
         assert controller.set_voice_gate(None) is False
+
+
+class TestControllerSpeakerIdWiring:
+    """The controller composes the speaker verifier and surfaces its counters."""
+
+    def test_a_disabled_speaker_id_config_wires_no_verifier(self, tmp_path) -> None:
+        """The default costs nothing: the gate is built with speaker_verifier=None."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 1.0)
+        controller = CaptureController(
+            config=AudioConfig(window_ms=500, hop_ms=250),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder([]),
+            speaker_id=SpeakerIdConfig(enabled=False),
+        )
+        assert controller.start()
+        try:
+            assert controller.poll().speaker_id_backend == "none"
+        finally:
+            controller.stop()
+
+    def test_a_verified_phrase_produces_a_snippet_carrying_the_speaker(
+        self, tmp_path
+    ) -> None:
+        """The whole path: file replay, gate match, verifier match, UiStats."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 4.0)
+        verifier = _FakeVerifier(matched=True, speaker="alice", score=0.87)
+        controller = CaptureController(
+            config=AudioConfig(
+                window_ms=1000, hop_ms=500, drop_policy=DropPolicy.BLOCK
+            ),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder(
+                [(32_000, Recognition("ok google turn it up", final=True))]
+            ),
+            speaker_id=SpeakerIdConfig(enabled=True, qnn_onnx_path="unused.onnx", qnn_worker_python="unused"),
+            speaker_verifier_builder=_scripted_verifier_builder(verifier),
+        )
+        assert controller.start()
+        try:
+            assert controller.pipeline is not None
+            controller.pipeline.wait_until_finished(timeout=30)
+        finally:
+            controller.stop()
+
+        stats = controller.poll()
+        assert stats.speaker_id_backend == "qnn"
+        assert stats.gate_snippets == 1, "a matched speaker must not block the snippet"
+        assert stats.speaker_verified == 1
+        assert stats.speaker_rejected == 0
+        assert stats.speaker_last_name == "alice"
+        assert stats.speaker_last_score == pytest.approx(0.87)
+        assert verifier.calls == 1
+        assert verifier.closed is True, "stop() must close the verifier along with the gate"
+
+    def test_a_rejected_speaker_suppresses_the_snippet(self, tmp_path) -> None:
+        """Fail-closed at the controller level too: no verifier match, no file."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 4.0)
+        verifier = _FakeVerifier(matched=False, speaker=None, score=0.0)
+        controller = CaptureController(
+            config=AudioConfig(
+                window_ms=1000, hop_ms=500, drop_policy=DropPolicy.BLOCK
+            ),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder(
+                [(32_000, Recognition("ok google turn it up", final=True))]
+            ),
+            speaker_id=SpeakerIdConfig(enabled=True, qnn_onnx_path="unused.onnx", qnn_worker_python="unused"),
+            speaker_verifier_builder=_scripted_verifier_builder(verifier),
+        )
+        assert controller.start()
+        try:
+            assert controller.pipeline is not None
+            controller.pipeline.wait_until_finished(timeout=30)
+        finally:
+            controller.stop()
+
+        stats = controller.poll()
+        assert stats.gate_snippets == 0
+        assert stats.gate_detected == 1, "the phrase was still heard"
+        assert stats.speaker_rejected == 1
+        assert stats.speaker_verified == 0
+        assert list((tmp_path / "snippets").glob("*.wav")) == []
+
+    def test_a_verifier_that_will_not_start_does_not_fail_the_capture(
+        self, tmp_path
+    ) -> None:
+        """Recording without speaker verification beats not recording at all."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 1.0)
+        messages: list[str] = []
+
+        def failing_builder(config: SpeakerIdConfig) -> VerifierChoice:
+            return VerifierChoice(None, "none", "QNN subprocess chain went missing")
+
+        controller = CaptureController(
+            config=AudioConfig(window_ms=500, hop_ms=250),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder([]),
+            speaker_id=SpeakerIdConfig(enabled=True, qnn_onnx_path="unused.onnx", qnn_worker_python="unused"),
+            speaker_verifier_builder=failing_builder,
+        )
+        controller.error_occurred.connect(messages.append)
+        assert controller.start()
+        try:
+            assert controller.state is CaptureState.RUNNING
+            assert any("QNN subprocess chain went missing" in text for text in messages)
+        finally:
+            controller.stop()
+
+    def test_set_speaker_id_rejects_none(self) -> None:
+        """A None config is refused rather than replacing a working one."""
+        controller = CaptureController(speaker_id=SpeakerIdConfig())
+        assert controller.set_speaker_id(None) is False
+
+    def test_set_speaker_id_adopts_a_new_config(self) -> None:
+        controller = CaptureController(speaker_id=SpeakerIdConfig(enabled=False))
+        new_config = SpeakerIdConfig(enabled=True, qnn_onnx_path="x.onnx", qnn_worker_python="y")
+        assert controller.set_speaker_id(new_config) is True
+        assert controller.speaker_id_config is new_config
+
+    def test_set_speaker_id_enabled_toggles_the_flag(self) -> None:
+        controller = CaptureController(speaker_id=SpeakerIdConfig(enabled=False))
+        assert controller.set_speaker_id_enabled(True) is True
+        assert controller.speaker_id_config.enabled is True
 
 
 class TestControllerNotifyWiring:
