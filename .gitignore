@@ -13,6 +13,11 @@ dist/
 .venv/
 venv/
 env/
+# The x64 venv holding vosk, created by scripts/setup_voice_gate.py. Separate
+# from the main environment on purpose: on Windows ARM64 it is built from an
+# emulated x64 interpreter, so its wheels are the wrong architecture for the
+# native one.
+.venv-vosk/
 
 # Test / tooling caches
 .pytest_cache/
@@ -27,6 +32,13 @@ htmlcov/
 *.wav
 !tests/fixtures/*.wav
 recordings/
+
+# Wake-phrase snippets (VoiceGateSink output).
+snippets/
+
+# Speech models. vosk-model-small-en-us-0.15 is ~40 MB unpacked and is
+# fetched by scripts/setup_voice_gate.py -- never committed.
+models/
 
 # Editor / OS
 .vscode/

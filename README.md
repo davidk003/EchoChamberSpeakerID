@@ -42,8 +42,34 @@ pytest                             # 600+ tests, no microphone required
 | `echochamber/audio/sinks.py` | `QueueSink`, `TeeSink`, `WavRecorderSink`, latency tracking |
 | `echochamber/audio/sources/` | `FileSource` (replay) and `SoundDeviceSource` (live) |
 | `echochamber/audio/pipeline.py` | Wires it together |
+| `echochamber/voicegate/` | Wake-phrase gate: record a snippet only when a phrase is said |
 | `echochamber/ui/` | PySide6 GUI; all logic in `controller.py`, widgets stay dumb |
 | `docs/architecture.md` | Design rationale, latency model, and the hard-won gotchas |
+
+## Wake-phrase voice gate
+
+Off by default. When enabled, the pipeline stops keeping everything and keeps only what
+follows a configured phrase — `"ok google"`, `"hey google"` — as one WAV snippet each.
+
+```bash
+python scripts/setup_voice_gate.py     # fetches the model, builds the recognizer venv
+```
+
+It is a `ChunkSink` composed alongside the existing one, so nothing upstream changes. The
+snippet is seeded with `pre_roll_ms` of audio kept from *before* the match, because a
+recognizer only reports a phrase after consuming it — without the pre-roll the snippet
+would start after the phrase it is named for. Matching is on whole words, so `"ok google"`
+fires on `"ok google turn it up"` but not on `"look google it"`.
+
+**`vosk` has no `win_arm64` wheel**, and the deployment target is Windows ARM64. So on
+ARM64 vosk is not installed into the main environment at all: it runs in a separate
+**x64** venv as a subprocess (Windows' Prism emulator runs it transparently) and the gate
+talks to it over a pipe, keeping the real-time capture path native. `setup_voice_gate.py`
+prints exactly what to configure. See `docs/architecture.md` §3.7 for the full rationale —
+including what has *not* yet been verified on real ARM64 hardware.
+
+Recognition is pluggable and absent by default: with no vosk and no model, the gate is
+inert and the entire test suite still passes.
 
 ## Two things that will bite you
 

@@ -283,6 +283,120 @@ design depends on.
 
 ---
 
+## 3.7 Wake-phrase voice gate (`voicegate/`)
+
+The ingestion pipeline emits a window every `hop_ms` whether anyone is speaking or not.
+The gate adds the opposite policy: keep **nothing** until a configured phrase (`"ok
+google"`, `"hey google"`) is recognised, then write exactly one snippet around it.
+
+It is **a sink, not a stage**. `VoiceGateSink` implements `ChunkSink` and is composed
+alongside the existing sink with `TeeSink`, so nothing upstream of the queue changes and
+the gate inherits the property that already matters most: a slow consumer costs *dropped
+chunks*, which are counted, rather than *lost audio*, which is not.
+
+### Pre-roll is not a nicety
+
+A recogniser only reports a phrase **after** it has consumed the audio containing it. By
+the time the gate learns that "ok google" was said, that audio is already in the past —
+so a snippet opened at the moment of the match begins *after* the phrase it is named for.
+`PreRollBuffer` keeps the last `pre_roll_ms` of PCM in a bounded deque and the snippet is
+seeded with it. The default 1500 ms covers a slowly spoken phrase plus lead-in.
+
+Post-roll is the mirror: recording continues `post_roll_ms` past the match. A second match
+while a snippet is open **extends** that deadline rather than opening a second file, and
+`max_snippet_ms` caps the result so a phrase repeated indefinitely cannot record
+indefinitely. `cooldown_ms` then suppresses matches for a moment after a snippet closes —
+small models routinely emit the same phrase twice across consecutive results, and without
+a refractory period that writes two near-identical files.
+
+### Only finals, never partials
+
+Vosk emits a partial after nearly every buffer and a final when an utterance settles. The
+gate acts **only on finals**. A partial can contain a phrase that the final decode then
+revokes, which would open a snippet for something nobody said. Partials are still
+surfaced through `Recognition.final=False` so a UI can display them.
+
+### Matching is word-runs, not substrings
+
+`"ok google"` must fire on `"ok google turn the volume up"` and must **not** fire on
+`"look google it"` — and `"ok google"` genuinely is a substring of the latter. So
+`matching.py` compares runs of whole normalised tokens. Normalisation is aggressive and
+lossy (case, punctuation, combining marks all discarded) because small models punctuate
+the same utterance inconsistently between decodes.
+
+### Grammar constraint
+
+Given a fixed phrase set, `KaldiRecognizer` is constructed with a JSON grammar listing the
+phrases plus `[unk]`. The decoder then cannot propose words outside it, so `"ok google"`
+stops competing with every acoustically similar phrase in English. Markedly more accurate
+and cheaper than open vocabulary for this job.
+
+### The ARM64 problem, and the subprocess that solves it
+
+> **`vosk` publishes no `win_arm64` wheel** — only `win_amd64`, manylinux and macOS. Its
+> maintainers list Windows ARM64 under "we do not support". Building it would mean
+> building Kaldi + OpenFST + a BLAS for MSVC ARM64, which nobody appears to have done.
+> Under this project's standing rule that rules vosk out for in-process use on the
+> deployment target, exactly as it ruled out `soxr`.
+
+The resolution is process isolation rather than substitution. Windows 11 on ARM64 runs x64
+binaries transparently under the Prism emulator, so an **x64 `python.exe`** installed on
+an ARM64 machine can `pip install vosk` and run it. What must *not* happen is running the
+whole app that way: the WASAPI callback is real-time and the architecture's 0-xrun budget
+(§3, §3.3) is not something to spend on emulation overhead.
+
+So the boundary is drawn at the process edge:
+
+```
+native ARM64 python                        x64 python (Prism-emulated)
+┌────────────────────────────────┐         ┌──────────────────────────┐
+│ WASAPI capture, ring, chunker, │  pipe   │ worker.py                │
+│ Qt GUI, VoiceGateSink          │◄───────►│   vosk Model +           │
+│   └─ SubprocessRecognizer ─────┼─────────┤   KaldiRecognizer        │
+└────────────────────────────────┘  frames └──────────────────────────┘
+        real-time, native                     emulated, relaxed budget
+```
+
+This is the same reasoning that put the ML stage behind a queue and a consumer thread in
+the first place (§2) — it just moves the boundary across a process edge instead of a
+thread edge. Emulation overhead lands on Kaldi decoding, which has seconds of budget, not
+on the callback, which has milliseconds.
+
+`SubprocessRecognizer` swaps in wherever the in-process `VoskRecognizer` would go; both
+satisfy the same `Recognizer` protocol, and so does `NullRecognizer`, which is the default
+and never matches. **A checkout with no vosk and no model still imports, still runs the
+GUI, and still passes the whole suite** — the gate is simply inert.
+
+**The reader thread is mandatory, not an optimisation.** The parent writes audio while the
+worker writes results. If the parent only read after writing, both ends could block on
+full pipe buffers and deadlock. A daemon thread drains the worker's stdout continuously
+into a deque; a second drains stderr, because a worker traceback is the single most useful
+artefact when this breaks and discarding it would leave "startup failed" and nothing else.
+
+**stdio must be binary on Windows.** The worker calls `msvcrt.setmode(fd, os.O_BINARY)` on
+stdin and stdout. Without it Windows translates `\n` to `\r\n` inside the PCM stream and
+corrupts every frame — a data-dependent corruption that looks like a decoder bug.
+
+Frames are five bytes of header (kind, big-endian length) then payload. Newline-delimited
+JSON was rejected: audio is the bulk of the traffic and raw `int16` PCM contains `\n`
+constantly, so a line protocol would need escaping or base64, inflating the hot path by a
+third to solve a problem an explicit length does not have.
+
+### Honest limitations
+
+- **A dropped chunk is a hole in the snippet.** The gate sits downstream of the bounded
+  queue, so under `DROP_OLDEST` it never sees audio the queue discarded. `chunks_dropped`
+  being non-zero means snippet audio may be missing, exactly as it does for
+  `WavRecorderSink`'s `gaps`.
+- **The gate cannot be verified on ARM64 from this repository.** The subprocess design is
+  sound and the protocol is tested, but nothing here has executed against a real x64
+  venv on real Windows ARM64 hardware. That validation is outstanding.
+- The small model is not a wake-word engine. It is a general ASR model constrained by a
+  grammar, which is accurate enough for a gate but will produce false fires; `cooldown_ms`
+  bounds the damage rather than eliminating it.
+
+---
+
 ## 4. Module layout
 
 ```
@@ -301,12 +415,24 @@ echochamber/
       base.py
       sounddevice_source.py
       file_source.py
+  voicegate/
+    config.py            # VoiceGateConfig: phrases, pre/post-roll, cooldown
+    matching.py          # normalise + whole-word phrase matching (pure)
+    recognizer.py        # Recognizer protocol, Null/Scripted/Vosk backends
+    snippets.py          # PreRollBuffer, SnippetWriter, snippet_filename
+    sink.py              # VoiceGateSink: the gate itself
+    protocol.py          # length-prefixed frames for the worker pipe
+    subprocess_recognizer.py  # x64 worker bridge (the ARM64 workaround)
+    worker.py            # child-process entry point; runs inside the x64 venv
   ui/
     main_window.py
     device_panel.py
     meters.py
     stats_panel.py
+    voice_gate_panel.py
   app.py                 # entry point
+scripts/
+  setup_voice_gate.py    # builds the x64 venv, fetches the model
 tests/
   test_ringbuffer.py
   test_chunker.py
@@ -327,6 +453,20 @@ queue_max   = 8
 drop_policy = DROP_OLDEST
 ```
 
+Voice gate (`VoiceGateConfig`), all off by default:
+
+```python
+enabled      = False     # needs a model this repo does not ship
+phrases      = ("ok google", "hey google")
+model_path   = None      # -> NullRecognizer, gate never fires
+pre_roll_ms  = 1500      # must cover the phrase itself; see §3.7
+post_roll_ms = 3000
+max_snippet_ms = 15_000  # ceiling on an extended snippet
+cooldown_ms  = 1000      # refractory period after a snippet closes
+snippet_dir  = "snippets"
+worker_python = None     # None = in-process; a path = x64 subprocess backend
+```
+
 ## 6. Testing
 
 The chunker is pure logic over a buffer, so it gets tested exactly:
@@ -338,6 +478,20 @@ The chunker is pure logic over a buffer, so it gets tested exactly:
 - Reconfiguration mid-stream: assert alignment resets and `discontinuous` is set once.
 - Backpressure: a deliberately slow sink must drop, not block, and the drop count must match.
 
+The voice gate follows the same principle — **the whole suite runs with no vosk installed
+and no model on disk**, which is not merely convenient but the only way it can run on the
+ARM64 target at all:
+
+- Phrase matching is a pure function over strings: assert `"ok google"` fires on
+  `"ok google turn it up"` and does *not* fire on `"look google it"`.
+- `ScriptedRecognizer` emits chosen results after chosen byte offsets, so pre-roll
+  inclusion, post-roll cutoff, extension, truncation and cooldown are all asserted
+  deterministically against synthetic chunks — no audio, no model, no timing.
+- The wire protocol is tested against `BytesIO`: round-trips, short reads spanning frame
+  boundaries, truncated payloads, bad kinds, oversized lengths.
+- `SubprocessRecognizer` is tested against an injected fake `popen`, so startup, READY,
+  ERROR, worker death and shutdown are covered without launching a process.
+
 ## 7. Dependencies to add
 
 - `sounddevice >= 0.5.5` (win_arm64 wheel available)
@@ -346,6 +500,12 @@ The chunker is pure logic over a buffer, so it gets tested exactly:
 Deliberately *not* added: `soxr` / `librosa` / `scipy` for resampling — no ARM64 wheels and not
 needed while the device delivers the target rate. Revisit only if measured resampling quality
 becomes a problem.
+
+`vosk` is an **optional extra**, never a runtime dependency (`pip install .[voice-gate]`).
+It has no `win_arm64` wheel, so on the deployment target it is not installed into the main
+environment at all — it lives in a separate x64 venv that `scripts/setup_voice_gate.py`
+builds, and the gate talks to it over a pipe. See §3.7. Nothing in `echochamber/` imports
+`vosk` at module scope; the only import is lazy, inside `load_vosk_recognizer`.
 
 ## 8. Build order
 

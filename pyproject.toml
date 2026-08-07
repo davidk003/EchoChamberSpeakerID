@@ -26,6 +26,16 @@ dev = [
     "pytest>=8",
     "pytest-qt>=4.5",
 ]
+# The wake-phrase voice gate. Deliberately NOT a runtime dependency: vosk
+# publishes no win_arm64 wheel, so on the ARM64 deployment target this extra
+# cannot be installed into the main environment at all. There, vosk lives in a
+# separate x64 venv and the gate talks to it over a pipe -- see
+# echochamber/voicegate/subprocess_recognizer.py and
+# scripts/setup_voice_gate.py. Installing this extra is only useful on x86-64,
+# where the in-process backend works directly.
+voice-gate = [
+    "vosk>=0.3.45",
+]
 
 [project.scripts]
 echochamber = "echochamber.app:main"

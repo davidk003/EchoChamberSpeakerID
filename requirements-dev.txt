@@ -6,3 +6,9 @@ pytest>=8
 # pytest-qt is pure Python, so it carries no ARM64 wheel risk.
 # GUI tests need QT_QPA_PLATFORM=offscreen; see tests/test_ui_*.py.
 pytest-qt>=4.5
+
+# `vosk` is deliberately absent. The voice gate's tests drive a scripted
+# recogniser instead of a real model, so the whole suite runs with no vosk
+# installed and no model on disk -- which is also the only way it can run on
+# the ARM64 target, where vosk has no wheel. To exercise the real decoder on
+# x86-64: pip install .[voice-gate], then python scripts/setup_voice_gate.py
