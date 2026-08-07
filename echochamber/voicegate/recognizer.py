@@ -275,10 +275,15 @@ def parse_vosk_result(payload: str, final: bool) -> Recognition:
     confidence = 0.0
     words = parsed.get("result")
     if isinstance(words, list) and words:
+        # `bool` is a subclass of `int`, so a JSON `true` would otherwise pass
+        # the numeric check and contribute a confidence of 1.0 -- the most
+        # confident value there is, from a field that carried no number at all.
         scores = [
             float(word["conf"])
             for word in words
-            if isinstance(word, dict) and isinstance(word.get("conf"), (int, float))
+            if isinstance(word, dict)
+            and isinstance(word.get("conf"), (int, float))
+            and not isinstance(word.get("conf"), bool)
         ]
         if scores:
             confidence = sum(scores) / len(scores)

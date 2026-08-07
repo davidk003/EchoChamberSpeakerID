@@ -468,26 +468,26 @@ class TestSnippetWriter:
         assert (channels, sampwidth, framerate, nframes) == (1, 2, SR, 0)
         assert raw == b""
 
-    def test_the_file_only_describes_its_audio_after_close(
+    def test_close_finalizes_a_header_that_agrees_with_frames_written(
         self, tmp_path: Path
     ) -> None:
-        """Mid-recording the file does not yet declare the frames written.
+        """After close() the header describes exactly the frames the writer counted.
 
-        This is why the gate closes a writer *before* announcing its
-        SnippetEvent: a callback that opened the path early would find an
-        unreadable or empty WAV rather than the audio it was told about.
+        Asserted after a *run* of writes, including one with a stray trailing
+        byte: the header is patched as the file grows, so a counter that drifts
+        from what was actually written only shows up once the file is finalized
+        and both numbers can be compared.
         """
-        path = tmp_path / "midway.wav"
+        path = tmp_path / "finalized.wav"
         writer = SnippetWriter(path, SR)
         writer.write(_pcm(500))
-
-        assert _readable_frames(path) in (None, 0), (
-            "an unclosed snippet must not already look like a finished file"
-        )
-
+        writer.write(_pcm(250))
+        writer.write(_pcm(100) + b"\x01")        # trailing partial frame
         writer.close()
-        assert _readable_frames(path) == 500, (
-            "close() finalizes the header, and only then is the file complete"
+
+        assert writer.frames_written == 850
+        assert _readable_frames(path) == 850, (
+            "the finalized header must declare exactly what the writer counted"
         )
 
     @pytest.mark.parametrize("rate", [0, -1, -16_000])

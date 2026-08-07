@@ -413,18 +413,17 @@ class TestWriteFrame:
             write_frame(stream, kind)  # type: ignore[arg-type]
         assert stream.flush_calls == 3
 
-    def test_refuses_an_oversized_payload_without_writing_anything(self) -> None:
+    def test_refuses_an_oversized_payload_without_writing_anything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The size check runs before the write, so nothing half-lands."""
         import echochamber.voicegate.protocol as protocol
 
+        monkeypatch.setattr(protocol, "MAX_PAYLOAD", 4)
         stream = RecordingStream()
-        original = protocol.MAX_PAYLOAD
-        try:
-            protocol.MAX_PAYLOAD = 4
-            with pytest.raises(ProtocolError, match="exceeds"):
-                protocol.write_frame(stream, FrameKind.AUDIO, b"12345")  # type: ignore[arg-type]
-        finally:
-            protocol.MAX_PAYLOAD = original
+        with pytest.raises(ProtocolError, match="exceeds"):
+            protocol.write_frame(stream, FrameKind.AUDIO, b"12345")  # type: ignore[arg-type]
+
         assert stream.buffer == b"", "a refused frame must not be partially written"
         assert stream.flush_calls == 0
 

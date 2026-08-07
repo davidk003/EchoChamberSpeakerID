@@ -272,9 +272,14 @@ class SnippetWriter:
     def close(self) -> None:
         """Finalize the WAV header and release the file.  Idempotent.
 
-        Until this returns the header still declares zero frames, so a reader
-        opening the file mid-recording sees an empty snippet.  That is why the
-        gate closes the writer before announcing a snippet to its callback.
+        **A snippet is only trustworthy once this has returned.**  How much of
+        the audio is on disk before then is a question about buffering rather
+        than about this class -- :mod:`wave` re-patches the frame count as it
+        goes, but the underlying file object may have flushed none, some or all
+        of it -- so a reader opening the file mid-recording can find anything
+        from an empty file to a short one.  Only after ``close`` does the header
+        agree with :attr:`frames_written`.  That is why the gate closes the
+        writer before announcing a snippet to its callback.
         """
         wav = self._wav
         if wav is None:

@@ -520,4 +520,22 @@ builds, and the gate talks to it over a pipe. See §3.7. Nothing in `echochamber
    driving a live microphone at 30.1 Hz with no thread outliving the window)
 6. ~~Latency instrumentation + a stub consumer standing in for the ML stage~~ — **done**
    (690 tests passing; `LatencyTracker`, `StubInferenceSink`, percentiles in the stats panel)
+7. ~~Wake-phrase voice gate: `voicegate/` + the x64 subprocess bridge + GUI panel~~ —
+   **done** (1503 tests passing; verified headless end-to-end, a `FileSource` through the
+   real ring, chunker, bounded queue and consumer thread into the gate, producing a
+   1.000 s snippet from a 500 ms pre-roll plus a 500 ms post-roll)
+
+   **Outstanding, and it is the part that matters most:** nothing in the Vosk path has run
+   against a real model. Every test drives a `ScriptedRecognizer`, which is what keeps the
+   suite runnable on a machine where vosk cannot be installed — but it means the first real
+   decode has not happened yet. Three things need checking on actual Windows ARM64 hardware
+   before this can be called working:
+
+   1. `pip install vosk` genuinely succeeds in a venv built from an x64 `python.exe`
+      under Prism (`scripts/setup_voice_gate.py` checks the interpreter's architecture by
+      running `platform.machine()` *inside* it, so a wrong pick fails fast and clearly).
+   2. The worker launches, loads the model, and the grammar-constrained decoder actually
+      recognises "ok google" at a useful rate.
+   3. Capture still measures 0 xruns with the gate running — which is the entire reason
+      the decoder was put in another process rather than in this one.
 ```
