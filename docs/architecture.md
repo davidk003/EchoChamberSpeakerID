@@ -105,8 +105,28 @@ is a 192 KB memcpy per hop — microseconds. Do not try to avoid it.
 
 **Live reconfiguration:** `window_ms` / `hop_ms` live in a frozen dataclass held in a single
 attribute; the GUI swaps the whole object atomically. The chunker re-reads it at the top of
-each iteration, realigns `next_start` to the current write head, and flags the next chunk
-`discontinuous=True`. No locks, no restart of the audio device.
+each iteration, realigns `next_start`, and flags the next chunk `discontinuous=True`. No
+locks, no restart of the audio device.
+
+The realignment frame is captured by `reconfigure()` at the moment of the call, *not* sampled
+by the loop when it notices. The loop may not run for up to `POLL_INTERVAL_S`, and on a live
+stream the write head moves the whole time — sampling it in the loop would put the new window
+grid at a position determined purely by thread scheduling. That is both surprising to callers
+and impossible to test deterministically. Audio buffered between the old read position and the
+capture point is deliberately skipped: reconfiguring means "start fresh from now", not "catch
+up first".
+
+**Two invariants downstream must not assume.** After an overrun the chunker resyncs to
+`ring.oldest_frame`, so `start_frame` is *not* a multiple of `hop_frames` in general — the
+grid restarts wherever surviving audio begins. Any consumer deriving chunk index from
+`start_frame / hop` is wrong; use `seq`, which is gap-free and never resets. Every such chunk
+carries `discontinuous=True`, which is the intended signal.
+
+**Config/ring pairing.** `AudioConfig.ring_frames` is a derived figure; the actual `RingBuffer`
+is constructed separately, and nothing forces them to agree. `WindowChunker` rejects a window
+larger than the ring's capacity at construction and on `reconfigure()`, because otherwise the
+mismatch surfaces as a `ValueError` deep on the chunker thread and the stream simply never
+produces a chunk.
 
 ### 3.3 Latency model
 
@@ -240,7 +260,7 @@ becomes a problem.
 ## 8. Build order
 
 1. ~~`types.py`, `config.py`, `ringbuffer.py` + tests~~ — **done** (288 tests passing)
-2. `chunker.py` + ramp tests (no audio device needed yet)
+2. ~~`chunker.py` + ramp tests (no audio device needed yet)~~ — **done** (353 tests passing)
 3. `sinks.py`, `pipeline.py`, `file_source.py` — full pipeline testable headless
 4. `sounddevice_source.py` + device enumeration — first live audio
 5. GUI: device panel, start/stop, meters, stats
