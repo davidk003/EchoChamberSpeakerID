@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from echochamber.audio.sources.base import AudioCallback, AudioSource
 from echochamber.audio.sources.file_source import FileSource
+from echochamber.audio.sources.sounddevice_source import SoundDeviceSource
 
 __all__ = [
     "AudioCallback",
     "AudioSource",
     "FileSource",
+    "SoundDeviceSource",
 ]

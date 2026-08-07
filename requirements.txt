@@ -1,0 +1,5 @@
+# Runtime dependencies.
+# Deployment target is Windows ARM64: check that a win_arm64 wheel exists
+# before adding anything new here (this already ruled out soxr).
+numpy>=2.0
+sounddevice>=0.5.5

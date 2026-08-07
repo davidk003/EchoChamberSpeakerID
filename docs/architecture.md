@@ -24,7 +24,7 @@ Target platform: Windows, Python 3.11, PySide6 GUI.
 |---|---|---|
 | Capture backend | `sounddevice` (PortAudio, WASAPI) | Callback-driven, low latency, mature. Ships a `win_arm64` wheel as of 0.5.5. |
 | Source | Microphone / input devices | Loopback deferred; the source layer is an interface so it can be added later. |
-| Sample rate | Request target rate (16 kHz) from the device | WASAPI shared mode resamples inside the audio engine. Avoids a resampler dependency — `soxr` has **no ARM64 wheel**. Optional high-quality path behind a flag. |
+| Sample rate | Request target rate (16 kHz) from the device, **with WASAPI auto-convert enabled** | The Windows audio engine resamples for us. Avoids a resampler dependency — `soxr` has **no ARM64 wheel**. See the warning below: this does *not* work by default. |
 | Format | mono `float32` | What every audio model wants. Downmix happens once, in the callback. |
 | Handoff | In-process bounded queue + worker thread | Lowest latency. torch releases the GIL during inference, so a thread is sufficient. |
 | Sink API | `ChunkSink` protocol | Lets the queue be swapped for a process/network sink later without touching capture. |
@@ -32,6 +32,22 @@ Target platform: Windows, Python 3.11, PySide6 GUI.
 **Non-negotiable rule:** the PortAudio callback runs on a real-time-ish thread. It must never
 allocate, never lock, never log, and never touch Qt. Violating this causes xruns (dropouts),
 not just slowness.
+
+> **WASAPI will not resample unless you ask it to.** Measured on real hardware (Intel mic
+> array, 48 kHz native, PortAudio 19.7):
+>
+> ```
+> 16000 Hz mono, plain        -> PortAudioError: Invalid sample rate [PaErrorCode -9997]
+> 16000 Hz mono, auto_convert -> opens at 16000 Hz, real signal
+> ```
+>
+> Requesting a non-native rate from a WASAPI device fails outright unless the stream is opened
+> with `sounddevice.WasapiSettings(auto_convert=True)` passed as `extra_settings`. Nearly every
+> Windows capture device is 44.1 or 48 kHz, so without this flag 16 kHz capture fails on
+> essentially all of them. MME and DirectSound convert without the flag; WASAPI is the one that
+> needs it, and WASAPI is what we want for latency. Never silently fall back to the device's
+> native rate — the rest of the pipeline derives window geometry from `config.sample_rate`, so a
+> mismatch corrupts every timestamp rather than merely sounding wrong.
 
 ---
 
@@ -180,7 +196,15 @@ which failed silently — the pipeline ran perfectly and the meters simply never
 like a dead input device rather than a wiring mistake.
 
 - `SoundDeviceSource` — live capture. Also owns device enumeration and xrun counting via
-  PortAudio's `status` flags (`input_overflow`).
+  PortAudio's `status` flags (`input_overflow`). Opens WASAPI devices with
+  `WasapiSettings(auto_convert=True)`; see the warning in §3.
+  **Prefer a WASAPI device in the picker over PortAudio's reported default.** On the dev
+  machine the system default input is an *MME* device: it works (MME converts without a flag)
+  but measured ~30 ms input latency against ~22 ms for the same physical microphone via
+  WASAPI, and it bypasses the auto-convert path entirely, so a device-picker default of "system
+  default" would silently never exercise it. MME also truncates device names to 31 characters,
+  so the same microphone appears under different names across host APIs — which is why
+  `DeviceInfo.label` includes the host API and name lookups reject ambiguous matches.
 - `FileSource` — replays a WAV through the identical ring/chunker path, either at real-time
   pace or as fast as possible. This is what makes the chunker **deterministically testable**
   and lets the whole GUI be exercised without a microphone.
@@ -194,6 +218,8 @@ PySide6. The audio path never calls into Qt directly.
 - A 30 Hz `QTimer` polls a `StreamStats` snapshot (peak/RMS level, chunk count, dropped count,
   xruns, measured latency). Polling rather than per-chunk signals — at `hop_ms = 50` a signal
   per chunk would flood the event loop, and the display can't show more than ~60 Hz anyway.
+  Note `peak_level` / `rms_level` are *last block only*, not a running maximum, so the meter
+  needs its own decay/hold — read naively at shutdown it shows ~0 even after a loud session.
 - Rare events (device error, stream stopped, discontinuity) do use queued `Signal`s.
 - Widgets: device selector, start/stop, `window_ms` / `hop_ms` spinboxes with a live "overlap:
   N ms (P %)" readout, level meter, scrolling waveform, and a stats panel showing dropped
@@ -273,7 +299,8 @@ becomes a problem.
 3. ~~`sinks.py`, `pipeline.py`, `file_source.py` — full pipeline testable headless~~ —
    **done** (506 tests passing; a WAV replays end-to-end through the real ring, chunker,
    bounded queue and consumer thread)
-4. `sounddevice_source.py` + device enumeration — first live audio
+4. ~~`sounddevice_source.py` + device enumeration — first live audio~~ — **done**
+   (545 tests passing; verified against real hardware at 16 kHz from a 48 kHz WASAPI device)
 5. GUI: device panel, start/stop, meters, stats
 6. Latency instrumentation + a stub consumer standing in for the ML stage
 ```

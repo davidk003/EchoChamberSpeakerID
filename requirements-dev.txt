@@ -1,0 +1,5 @@
+# Development dependencies, on top of requirements.txt.
+# Deployment target is Windows ARM64: check that a win_arm64 wheel exists
+# before adding anything new here.
+-r requirements.txt
+pytest>=8

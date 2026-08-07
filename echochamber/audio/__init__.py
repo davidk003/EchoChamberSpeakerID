@@ -11,6 +11,14 @@ import ``AudioConfig`` for type checking.
 from __future__ import annotations
 
 from echochamber.audio.chunker import POLL_INTERVAL_S, ChunkCallback, WindowChunker
+from echochamber.audio.devices import (
+    WASAPI_HOSTAPI_NAME,
+    DeviceError,
+    DeviceInfo,
+    default_input_device,
+    find_input_device,
+    list_input_devices,
+)
 from echochamber.audio.pipeline import (
     DRAIN_POLL_S,
     DRAIN_SETTLE_S,
@@ -26,13 +34,19 @@ from echochamber.audio.sinks import (
     WavRecorderSink,
     new_frame_count,
 )
-from echochamber.audio.sources import AudioCallback, AudioSource, FileSource
+from echochamber.audio.sources import (
+    AudioCallback,
+    AudioSource,
+    FileSource,
+    SoundDeviceSource,
+)
 from echochamber.audio.types import AudioChunk, DropPolicy, StreamStats
 
 __all__ = [
     "DRAIN_POLL_S",
     "DRAIN_SETTLE_S",
     "POLL_INTERVAL_S",
+    "WASAPI_HOSTAPI_NAME",
     "AudioCallback",
     "AudioChunk",
     "AudioPipeline",
@@ -40,15 +54,21 @@ __all__ = [
     "CallableSink",
     "ChunkCallback",
     "ChunkSink",
+    "DeviceError",
+    "DeviceInfo",
     "DropPolicy",
     "FileSource",
     "OverrunError",
     "QueueSink",
     "RingBuffer",
+    "SoundDeviceSource",
     "SourceFactory",
     "StreamStats",
     "TeeSink",
     "WavRecorderSink",
     "WindowChunker",
+    "default_input_device",
+    "find_input_device",
+    "list_input_devices",
     "new_frame_count",
 ]
