@@ -30,6 +30,7 @@ from echochamber.ui.device_panel import DevicePanel
 from echochamber.ui.geometry_panel import GeometryPanel
 from echochamber.ui.meters import LevelMeter
 from echochamber.ui.stats_panel import StatsPanel
+from echochamber.ui.voice_gate_panel import VoiceGatePanel
 
 __all__ = ["MainWindow"]
 
@@ -63,6 +64,7 @@ class MainWindow(QMainWindow):
         self.device_panel: DevicePanel = DevicePanel(self)
         self.geometry_panel: GeometryPanel = GeometryPanel(self)
         self.stats_panel: StatsPanel = StatsPanel(self)
+        self.voice_gate_panel: VoiceGatePanel = VoiceGatePanel(self)
         self.level_meter: LevelMeter = LevelMeter(self)
 
         meter_box = QGroupBox("Level", self)
@@ -79,6 +81,7 @@ class MainWindow(QMainWindow):
 
         right = QVBoxLayout()
         right.addWidget(self.stats_panel)
+        right.addWidget(self.voice_gate_panel)
         right.addStretch(1)
 
         central = QWidget(self)
@@ -104,6 +107,8 @@ class MainWindow(QMainWindow):
         self.device_panel.start_requested.connect(self._on_start_requested)
         self.device_panel.stop_requested.connect(self._on_stop_requested)
         self.geometry_panel.geometry_changed.connect(self._on_geometry_changed)
+        self.voice_gate_panel.enabled_changed.connect(self._on_gate_enabled_changed)
+        self.voice_gate_panel.phrases_changed.connect(self._on_gate_phrases_changed)
 
         self._controller.stats_updated.connect(self._on_stats_updated)
         self._controller.state_changed.connect(self._on_state_changed)
@@ -114,6 +119,11 @@ class MainWindow(QMainWindow):
         """Render the controller's current state, then enumerate devices."""
         config = self._controller.config
         self.geometry_panel.set_geometry(config.window_ms, config.hop_ms)
+        gate = self._controller.voice_gate_config
+        self.voice_gate_panel.set_config(gate.enabled, gate.phrases)
+        self.voice_gate_panel.set_editable(
+            self._controller.state is not CaptureState.RUNNING
+        )
         self.device_panel.set_state(self._controller.state)
         self.device_panel.set_devices(
             self._controller.devices, self._controller.selected_device
@@ -163,6 +173,34 @@ class MainWindow(QMainWindow):
                 f"geometry: window {window_ms} ms, hop {hop_ms} ms", 3000
             )
 
+    def _on_gate_enabled_changed(self, enabled: bool) -> None:
+        """Switch the wake-phrase gate on or off for the next run.
+
+        Args:
+            enabled: Whether the user ticked the box.  A rejected change is
+                rolled back in the panel, so the checkbox never shows a state
+                the controller did not accept.
+        """
+        if self._controller.set_voice_gate_enabled(enabled):
+            self.voice_gate_panel.set_note(
+                "takes effect on the next start" if enabled else ""
+            )
+        else:
+            gate = self._controller.voice_gate_config
+            self.voice_gate_panel.set_config(gate.enabled, gate.phrases)
+
+    def _on_gate_phrases_changed(self, phrases: tuple[str, ...]) -> None:
+        """Apply new wake phrases, rolling the field back if they are rejected.
+
+        Args:
+            phrases: The phrases the user typed.
+        """
+        if self._controller.set_voice_gate_phrases(phrases):
+            self.voice_gate_panel.set_note("takes effect on the next start")
+        else:
+            gate = self._controller.voice_gate_config
+            self.voice_gate_panel.set_config(gate.enabled, gate.phrases)
+
     # -- controller state --------------------------------------------------
 
     def _on_stats_updated(self, stats: UiStats) -> None:
@@ -172,6 +210,7 @@ class MainWindow(QMainWindow):
             stats: The snapshot emitted by the controller.
         """
         self.stats_panel.update_stats(stats)
+        self.voice_gate_panel.update_stats(stats)
         self.level_meter.set_levels(stats.rms_level, stats.display_peak)
         self.level_text.setText(
             f"rms {stats.rms_level:.3f}   peak {stats.display_peak:.3f}"
@@ -184,6 +223,9 @@ class MainWindow(QMainWindow):
             state: The controller's new state.
         """
         self.device_panel.set_state(state)
+        # The recogniser is built once per run, so gate settings cannot be
+        # edited into a running capture; see VoiceGatePanel's module docstring.
+        self.voice_gate_panel.set_editable(state is not CaptureState.RUNNING)
 
     def _on_devices_changed(self, devices: list[DeviceInfo]) -> None:
         """Repopulate the device picker.

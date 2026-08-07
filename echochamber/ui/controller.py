@@ -46,10 +46,18 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from echochamber.audio.devices import DeviceInfo, list_input_devices
 from echochamber.audio.latency import LatencySummary, LatencyTracker
 from echochamber.audio.pipeline import AudioPipeline, SourceFactory
+from echochamber.audio.sinks import ChunkSink, TeeSink
 from echochamber.audio.sources.sounddevice_source import SoundDeviceSource
 from echochamber.audio.types import AudioChunk, StreamStats
 from echochamber.config import AudioConfig
 from echochamber.ui.meters import PeakHold
+from echochamber.voicegate.backends import (
+    RecognizerChoice,
+    build_recognizer,
+    describe_backend,
+)
+from echochamber.voicegate.config import VoiceGateConfig
+from echochamber.voicegate.sink import VoiceGateSink, VoiceGateStats
 
 __all__ = [
     "POLL_INTERVAL_MS",
@@ -124,6 +132,19 @@ class UiStats:
         pipeline_max_ms: Worst observation in the rolling window.
         latency_samples: How many observations the percentiles are drawn from;
             0 means the figures are not yet meaningful.
+        gate_backend: Which recogniser the voice gate is using --
+            ``"subprocess"``, ``"in-process"`` or ``"none"``.  ``"none"`` while
+            the gate is configured on means it failed to start, and
+            ``gate_error`` says why.
+        gate_detected: Wake phrases matched in a final result.
+        gate_snippets: Snippet files completed.
+        gate_suppressed: Matches ignored inside the cooldown after a snippet.
+        gate_truncated: Snippets cut short by the maximum-length ceiling.
+        gate_last_phrase: Most recently matched phrase; empty before the first.
+        gate_last_path: Path of the most recent snippet, or ``None``.
+        gate_error: Whatever the gate last failed at, or ``None``.  A gate that
+            has stopped producing snippets is either hearing nothing or broken,
+            and this is how a display tells those apart.
     """
 
     state: CaptureState
@@ -142,6 +163,14 @@ class UiStats:
     pipeline_p95_ms: float = 0.0
     pipeline_max_ms: float = 0.0
     latency_samples: int = 0
+    gate_backend: str = "none"
+    gate_detected: int = 0
+    gate_snippets: int = 0
+    gate_suppressed: int = 0
+    gate_truncated: int = 0
+    gate_last_phrase: str = ""
+    gate_last_path: str | None = None
+    gate_error: str | None = None
 
 
 class LatestChunkSink:
@@ -349,6 +378,8 @@ class CaptureController(QObject):
         source_factory_builder: Callable[..., SourceFactory] | None = None,
         sd_module: Any = None,
         parent: QObject | None = None,
+        voice_gate: VoiceGateConfig | None = None,
+        recognizer_builder: Callable[..., RecognizerChoice] | None = None,
     ) -> None:
         """Create a stopped controller.  Nothing is enumerated or opened yet.
 
@@ -370,6 +401,17 @@ class CaptureController(QObject):
             sd_module: Module to use instead of the real :mod:`sounddevice`,
                 threaded through both enumeration and the default builder.
             parent: Qt parent, or ``None``.
+            voice_gate: Wake-phrase gate configuration; a disabled default
+                :class:`~echochamber.voicegate.config.VoiceGateConfig` when
+                ``None``, which costs nothing and wires no extra sink.
+            recognizer_builder: Callable returning a
+                :class:`~echochamber.voicegate.backends.RecognizerChoice`,
+                called with ``(config, sample_rate)`` at :meth:`start`.
+                Defaults to
+                :func:`~echochamber.voicegate.backends.build_recognizer`.  This
+                is the seam that lets a test drive the gate with a scripted
+                recogniser and no model -- the same role
+                ``source_factory_builder`` plays for the microphone.
         """
         super().__init__(parent)
 
@@ -380,6 +422,17 @@ class CaptureController(QObject):
             else source_factory_builder
         )
         self._sd_module: Any = sd_module
+        self._voice_gate_config: VoiceGateConfig = (
+            VoiceGateConfig() if voice_gate is None else voice_gate
+        )
+        self._recognizer_builder: Callable[..., RecognizerChoice] = (
+            build_recognizer if recognizer_builder is None else recognizer_builder
+        )
+        self._gate_sink: VoiceGateSink | None = None
+        self._gate_backend: str = "none"
+        # Survives stop(), like the latency figures: a run that just finished is
+        # exactly when you want to read what the gate caught.
+        self._gate_stats: VoiceGateStats = VoiceGateStats()
 
         self._state: CaptureState = CaptureState.STOPPED
         self._devices: list[DeviceInfo] = []
@@ -452,6 +505,16 @@ class CaptureController(QObject):
     def peak_hold(self) -> PeakHold:
         """The peak-hold feeding :attr:`UiStats.display_peak`."""
         return self._peak_hold
+
+    @property
+    def voice_gate_config(self) -> VoiceGateConfig:
+        """The wake-phrase gate configuration the next :meth:`start` will use."""
+        return self._voice_gate_config
+
+    @property
+    def gate_sink(self) -> VoiceGateSink | None:
+        """The live gate sink, or ``None`` when stopped or the gate is off."""
+        return self._gate_sink
 
     @property
     def poll_timer(self) -> QTimer:
@@ -538,13 +601,22 @@ class CaptureController(QObject):
             return True
 
         pipeline: AudioPipeline | None = None
+        gate_sink: VoiceGateSink | None = None
+        gate_note: str = ""
         try:
             factory = self._build_factory()
             # A fresh run starts with fresh percentiles; the previous run's
             # figures would otherwise blend into this one's.
             self._latency_tracker.reset()
             sink = LatestChunkSink(tracker=self._latency_tracker)
-            pipeline = AudioPipeline(self._config, sink, factory, StreamStats())
+            gate_sink, gate_note = self._build_gate()
+            # TeeSink only when there is actually a second sink: fanning out to
+            # one sink would add a layer of indirection to every chunk for
+            # nothing, on the thread that feeds the display.
+            terminal: ChunkSink = (
+                sink if gate_sink is None else TeeSink(sink, gate_sink)
+            )
+            pipeline = AudioPipeline(self._config, terminal, factory, StreamStats())
             pipeline.start()
         except Exception as exc:  # noqa: BLE001 - every failure is reported, not raised
             if pipeline is not None:
@@ -552,13 +624,24 @@ class CaptureController(QObject):
                     pipeline.stop(STOP_TIMEOUT_S)
                 except Exception:  # noqa: BLE001 - teardown of a failed start
                     pass
+            if gate_sink is not None:
+                # The pipeline never took ownership, so its close() will not run
+                # -- and the gate may be holding a live worker process.
+                try:
+                    gate_sink.close()
+                except Exception:  # noqa: BLE001 - teardown of a failed start
+                    pass
             self._pipeline = None
             self._sink = None
+            self._gate_sink = None
+            self._gate_backend = "none"
             self._fail(_describe(exc))
             return False
 
         self._pipeline = pipeline
         self._sink = sink
+        self._gate_sink = gate_sink
+        self._gate_stats = VoiceGateStats()
         self._peak_hold.reset()
         self._last_snapshot = StreamStats()
         self._latency_ms = 0.0
@@ -567,6 +650,13 @@ class CaptureController(QObject):
         self._start_time = time.monotonic()
         self._elapsed_at_stop = 0.0
         self._set_state(CaptureState.RUNNING)
+        if gate_note:
+            # Capture is running and healthy; only the gate failed.  Reported
+            # through the same channel as any other failure, but deliberately
+            # *not* as CaptureState.ERROR: recording without gating is a
+            # degraded success, and stopping the capture over it would be worse
+            # than the problem.
+            self.error_occurred.emit(gate_note)
         self._timer.start()
         self.poll()
         return True
@@ -597,8 +687,23 @@ class CaptureController(QObject):
             except Exception as exc:  # noqa: BLE001 - reported, not raised
                 self.error_occurred.emit(f"error while stopping capture: {exc}")
 
+        # Sampled *after* the pipeline has stopped, so the figures include the
+        # final snippet: AudioPipeline.stop closes the sink, which finalizes
+        # anything still recording.
+        self._sample_gate()
+        gate_sink = self._gate_sink
+        if gate_sink is not None:
+            # AudioPipeline.stop already closed the tee, and close is
+            # idempotent -- but a start that never reached the pipeline leaves
+            # a gate holding a worker process, and that must not outlive stop().
+            try:
+                gate_sink.close()
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                self.error_occurred.emit(f"error while stopping the voice gate: {exc}")
+
         self._pipeline = None
         self._sink = None
+        self._gate_sink = None
         self._latency_ms = 0.0
         self._message = ""
         self._error_reported = False
@@ -640,6 +745,72 @@ class CaptureController(QObject):
         self._config = new_config
         return True
 
+    def set_voice_gate(self, config: VoiceGateConfig) -> bool:
+        """Adopt a new wake-phrase gate configuration.
+
+        **Takes effect on the next start, never live.**  Unlike window geometry,
+        which the chunker re-reads each iteration, the gate's recogniser is
+        built once with a fixed sample rate and a fixed phrase grammar -- for
+        the subprocess backend, in another process that has already loaded a
+        model.  Swapping any of that under a running decoder would mean tearing
+        down and relaunching a worker mid-capture, and a half-written snippet
+        with it.  Recording the choice and letting the user restart is both
+        simpler and more predictable.
+
+        Args:
+            config: The new gate configuration.
+
+        Returns:
+            ``True``.  Never raises: this is wired to a checkbox and a text
+            field.  A ``None`` is rejected with ``False`` and a reported error
+            rather than replacing the configuration with something unusable.
+        """
+        if config is None:
+            self.error_occurred.emit("voice gate configuration must not be None")
+            return False
+        self._voice_gate_config = config
+        return True
+
+    def set_voice_gate_enabled(self, enabled: bool) -> bool:
+        """Switch the gate on or off for the next run.
+
+        Args:
+            enabled: Whether the gate should run.
+
+        Returns:
+            ``True`` on success, ``False`` if enabling was rejected -- which
+            happens when no phrase survives normalisation -- in which case
+            ``error_occurred`` carries the reason and the configuration is
+            unchanged.  Never raises.
+        """
+        try:
+            self._voice_gate_config = self._voice_gate_config.with_enabled(enabled)
+        except Exception as exc:  # noqa: BLE001 - wired to a checkbox
+            self.error_occurred.emit(_describe(exc))
+            return False
+        return True
+
+    def set_voice_gate_phrases(self, phrases: tuple[str, ...]) -> bool:
+        """Replace the wake phrases for the next run.
+
+        Args:
+            phrases: The new phrases, in any case and with any punctuation.
+
+        Returns:
+            ``True`` on success, ``False`` if the combination is invalid (for
+            instance every phrase normalising away while the gate is enabled),
+            in which case ``error_occurred`` carries the reason and the
+            configuration is **unchanged**.  Never raises.
+        """
+        try:
+            self._voice_gate_config = self._voice_gate_config.with_phrases(
+                tuple(phrases)
+            )
+        except Exception as exc:  # noqa: BLE001 - wired to a text field
+            self.error_occurred.emit(_describe(exc))
+            return False
+        return True
+
     # -- the tick ----------------------------------------------------------
 
     def poll(self) -> UiStats:
@@ -666,6 +837,7 @@ class CaptureController(QObject):
                 self._latency_ms = _source_latency_ms(pipeline)
             except Exception:  # noqa: BLE001 - a display tick must never raise
                 pass
+            self._sample_gate()
 
             error = _pipeline_error(pipeline)
             if error is not None and not self._error_reported:
@@ -704,6 +876,7 @@ class CaptureController(QObject):
         # Latency figures survive stopping on purpose: the run just finished is
         # exactly when you want to read what it achieved.
         latency = self._latency_tracker.summary()
+        gate = self._gate_stats
         return UiStats(
             state=self._state,
             frames_captured=raw.frames_captured,
@@ -721,7 +894,70 @@ class CaptureController(QObject):
             pipeline_p95_ms=latency.p95_ms,
             pipeline_max_ms=latency.max_ms,
             latency_samples=latency.count,
+            gate_backend=self._gate_backend,
+            gate_detected=gate.phrases_detected,
+            gate_snippets=gate.snippets_written,
+            gate_suppressed=gate.snippets_suppressed,
+            gate_truncated=gate.snippets_truncated,
+            gate_last_phrase=gate.last_phrase,
+            gate_last_path=gate.last_snippet_path,
+            gate_error=gate.error,
         )
+
+    def _sample_gate(self) -> None:
+        """Refresh the cached voice-gate counters, never raising.
+
+        Kept in a field rather than read straight into :meth:`_build_stats`
+        because the figures must survive :meth:`stop`, exactly as the latency
+        percentiles do -- the run that just ended is when someone wants to know
+        how many snippets it caught.
+        """
+        gate_sink = self._gate_sink
+        if gate_sink is None:
+            return
+        try:
+            self._gate_stats = gate_sink.snapshot()
+        except Exception:  # noqa: BLE001 - a display tick must never raise
+            pass
+
+    def _build_gate(self) -> tuple[VoiceGateSink | None, str]:
+        """Build the voice gate sink for this run, if the gate is enabled.
+
+        A recogniser that refuses to start is **not** a reason to refuse to
+        capture.  Building one can fail for wholly ordinary reasons -- a model
+        directory that moved, an x64 interpreter that was uninstalled -- and
+        every one of them surfaces exactly when the user presses Start.  So a
+        failure returns a note to show rather than an exception, and the gate is
+        simply not wired in.
+
+        Returns:
+            ``(sink, note)``.  ``sink`` is ``None`` when the gate is disabled or
+            could not be built; ``note`` is a message to show the user, empty
+            when there is nothing worth saying.
+
+        Raises:
+            Exception: Only if constructing :class:`VoiceGateSink` itself fails,
+                which means the configuration is unusable rather than the
+                recogniser unavailable, and is handled by :meth:`start`.
+        """
+        gate_config = self._voice_gate_config
+        if not gate_config.enabled:
+            self._gate_backend = "none"
+            return None, ""
+
+        choice = self._recognizer_builder(gate_config, self._config.sample_rate)
+        self._gate_backend = choice.backend
+        if not choice.ok:
+            # build_recognizer already fell back to a NullRecognizer and closed
+            # anything half-built, so there is nothing to clean up here.
+            return None, describe_backend(choice)
+
+        sink = VoiceGateSink(
+            gate_config,
+            self._config.sample_rate,
+            recognizer=choice.recognizer,
+        )
+        return sink, ""
 
     def _build_factory(self) -> SourceFactory:
         """Ask ``source_factory_builder`` for a factory for the current selection.

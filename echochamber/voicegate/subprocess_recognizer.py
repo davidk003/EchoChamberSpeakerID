@@ -564,15 +564,17 @@ class SubprocessRecognizer:
 
         self.close()
 
-        message = (
-            f"the recogniser worker failed to start: {reason}\n"
-            f"  command: {' '.join(self.command)}"
-        )
+        parts = [
+            f"the recogniser worker failed to start: {reason}",
+            f"  command: {' '.join(self.command)}",
+        ]
+        if reported:
+            parts.append(f"  worker reported:\n{_indent(reported)}")
         if tail:
-            message = f"{message}\n  worker stderr:\n{_indent(tail)}"
+            parts.append(f"  worker stderr:\n{_indent(tail)}")
         else:
-            message = f"{message}\n  worker stderr: (nothing)"
-        raise RecognizerStartupError(message)
+            parts.append("  worker stderr: (nothing)")
+        raise RecognizerStartupError("\n".join(parts))
 
     def _spawn(self, target: Callable[[], None], name: str) -> threading.Thread:
         """Start one daemon thread.
