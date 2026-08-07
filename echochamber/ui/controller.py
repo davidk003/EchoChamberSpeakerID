@@ -43,6 +43,9 @@ from typing import Any, Callable
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
+from echochamber.adb.config import AdbTriggerConfig, autodetect_adb_trigger_config
+from echochamber.adb.trigger import AdbHotwordTrigger, AdbTriggerChoice, build_adb_trigger
+from echochamber.adb.trigger import describe_backend as describe_adb_backend
 from echochamber.audio.devices import DeviceInfo, list_input_devices
 from echochamber.audio.latency import LatencySummary, LatencyTracker
 from echochamber.audio.pipeline import AudioPipeline, SourceFactory
@@ -190,6 +193,10 @@ class UiStats:
             non-zero means the listener cannot keep up, or is not there.
         notify_queued: Events waiting to be sent.
         notify_error: The notifier's most recent failure, or ``None``.
+        adb_trigger_backend: Which adb hotword-blocking backend is in use --
+            ``"adb"`` or ``"none"``.  ``"none"`` while the trigger is
+            configured on means it failed to start -- mirrors
+            ``gate_backend``'s own contract.
     """
 
     state: CaptureState
@@ -230,6 +237,7 @@ class UiStats:
     notify_dropped: int = 0
     notify_queued: int = 0
     notify_error: str | None = None
+    adb_trigger_backend: str = "none"
 
 
 class LatestChunkSink:
@@ -443,6 +451,8 @@ class CaptureController(QObject):
         transport_builder: Callable[..., tuple[Transport, str | None]] | None = None,
         speaker_id: SpeakerIdConfig | None = None,
         speaker_verifier_builder: Callable[..., VerifierChoice] | None = None,
+        adb_trigger: AdbTriggerConfig | None = None,
+        adb_trigger_builder: Callable[..., AdbTriggerChoice] | None = None,
     ) -> None:
         """Create a stopped controller.  Nothing is enumerated or opened yet.
 
@@ -505,6 +515,19 @@ class CaptureController(QObject):
                 seam that lets a test drive the gate with a scripted verifier
                 and no QNN subprocess chain -- the same role
                 ``recognizer_builder`` plays for Vosk.
+            adb_trigger: adb hotword-blocking trigger configuration.  When
+                ``None``, a default
+                :class:`~echochamber.adb.config.AdbTriggerConfig` is built via
+                :func:`~echochamber.adb.config.autodetect_adb_trigger_config`,
+                which is disabled by default -- mirroring ``speaker_id``'s own
+                default exactly.
+            adb_trigger_builder: Callable returning an
+                :class:`~echochamber.adb.trigger.AdbTriggerChoice`, called
+                with ``(config)`` at :meth:`start`.  Defaults to
+                :func:`~echochamber.adb.trigger.build_adb_trigger`.  The seam
+                that lets a test drive the trigger with a scripted adb call
+                and no real device attached -- the same role
+                ``speaker_verifier_builder`` plays for speaker verification.
         """
         super().__init__(parent)
 
@@ -533,6 +556,14 @@ class CaptureController(QObject):
         self._speaker_verifier_builder: Callable[..., VerifierChoice] = (
             build_verifier if speaker_verifier_builder is None else speaker_verifier_builder
         )
+        self._adb_trigger_config: AdbTriggerConfig = (
+            autodetect_adb_trigger_config() if adb_trigger is None else adb_trigger
+        )
+        self._adb_trigger_builder: Callable[..., AdbTriggerChoice] = (
+            build_adb_trigger if adb_trigger_builder is None else adb_trigger_builder
+        )
+        self._adb_trigger_backend: str = "none"
+        self._adb_trigger: AdbHotwordTrigger | None = None
         self._speaker_id_backend: str = "none"
         self._gate_sink: VoiceGateSink | None = None
         self._gate_backend: str = "none"
@@ -754,9 +785,11 @@ class CaptureController(QObject):
                     gate_sink.close()
                 except Exception:  # noqa: BLE001 - teardown of a failed start
                     pass
-            # The notifier is started before the pipeline exists, so a failure
-            # in between would otherwise leave its thread and socket running.
+            # The notifier and adb trigger are both started before the
+            # pipeline exists, so a failure in between would otherwise leave
+            # their threads running.
             self._close_notifier()
+            self._close_adb_trigger()
             self._pipeline = None
             self._sink = None
             self._gate_sink = None
@@ -832,6 +865,7 @@ class CaptureController(QObject):
                 self.error_occurred.emit(f"error while stopping the voice gate: {exc}")
 
         self._close_notifier()
+        self._close_adb_trigger()
 
         self._pipeline = None
         self._sink = None
@@ -1085,6 +1119,7 @@ class CaptureController(QObject):
             notify_dropped=notify.dropped,
             notify_queued=notify.queued,
             notify_error=notify.error,
+            adb_trigger_backend=self._adb_trigger_backend,
         )
 
     def _sample_notifier(self) -> None:
@@ -1113,6 +1148,24 @@ class CaptureController(QObject):
             notifier.close()
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             self.error_occurred.emit(f"error while stopping notifications: {exc}")
+
+    def _close_adb_trigger(self) -> None:
+        """Shut the adb hotword trigger down, reporting rather than raising.
+
+        Mirrors :meth:`_close_notifier` exactly: its worker thread is a
+        daemon, so a process exit would collect it either way -- but a
+        trigger left running across a stop/start would have two threads
+        issuing adb calls, and the second run's counters would include the
+        first run's backlog.
+        """
+        trigger = self._adb_trigger
+        self._adb_trigger = None
+        if trigger is None:
+            return
+        try:
+            trigger.close()
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            self.error_occurred.emit(f"error while stopping the adb hotword trigger: {exc}")
 
     def _sample_gate(self) -> None:
         """Refresh the cached voice-gate counters, never raising.
@@ -1154,6 +1207,7 @@ class CaptureController(QObject):
         if not gate_config.enabled:
             self._gate_backend = "none"
             self._speaker_id_backend = "none"
+            self._adb_trigger_backend = "none"
             return None, ""
 
         choice = self._recognizer_builder(gate_config, self._config.sample_rate)
@@ -1162,14 +1216,20 @@ class CaptureController(QObject):
             # build_recognizer already fell back to a NullRecognizer and closed
             # anything half-built, so there is nothing to clean up here.
             self._speaker_id_backend = "none"
+            self._adb_trigger_backend = "none"
             return None, describe_backend(choice)
 
         relay, note = self._build_notifier()
         speaker_choice, speaker_note = self._build_speaker_verifier()
-        # Both notes can be non-empty at once (gate started, notifier failed,
-        # verifier failed); start() only shows one per attempt, so the two are
-        # joined rather than one silently overwriting the other.
-        combined_note = "; ".join(part for part in (note, speaker_note) if part)
+        trigger, trigger_note = self._build_adb_trigger()
+        self._adb_trigger = trigger
+        # Any of the three notes can be non-empty at once (gate started,
+        # notifier failed, verifier failed, trigger failed); start() only
+        # shows one per attempt, so they are all joined rather than one
+        # silently overwriting another.
+        combined_note = "; ".join(
+            part for part in (note, speaker_note, trigger_note) if part
+        )
         sink = VoiceGateSink(
             gate_config,
             self._config.sample_rate,
@@ -1177,6 +1237,7 @@ class CaptureController(QObject):
             on_snippet=None if relay is None else relay.on_snippet,
             on_detected=None if relay is None else relay.on_detected,
             speaker_verifier=None if speaker_choice is None else speaker_choice.verifier,
+            on_verification=None if trigger is None else trigger.notify_verification,
         )
         return sink, combined_note
 
@@ -1206,6 +1267,32 @@ class CaptureController(QObject):
         if not choice.ok:
             return None, describe_speaker_backend(choice)
         return choice, ""
+
+    def _build_adb_trigger(self) -> tuple[AdbHotwordTrigger | None, str]:
+        """Build the ADB hotword-blocking trigger for this run, if enabled.
+
+        A trigger that refuses to start is **not** a reason to refuse to
+        capture, for exactly the same reason a broken verifier isn't: see
+        :meth:`_build_speaker_verifier`.  A missing adb binary or an
+        unreachable device means the gate and speaker verification still
+        work perfectly well without it -- only the hotword-blocking side
+        effect is unavailable.
+
+        Returns:
+            ``(trigger, note)``.  ``trigger`` is ``None`` when disabled or
+            unavailable; ``note`` is a message to show the user, empty when
+            there is nothing worth saying.
+        """
+        trigger_config = self._adb_trigger_config
+        if not trigger_config.enabled:
+            self._adb_trigger_backend = "none"
+            return None, ""
+
+        choice = self._adb_trigger_builder(trigger_config)
+        self._adb_trigger_backend = choice.backend
+        if not choice.ok:
+            return None, describe_adb_backend(choice)
+        return choice.trigger, ""
 
     def _build_notifier(self) -> tuple[NotifyRelay | None, str]:
         """Start the notifier for this run, if notifications are enabled.
