@@ -1,0 +1,13 @@
+# Normalise line endings in the repository to LF.
+#
+# Development happens on Windows but the deployment target is Windows ARM64 and
+# CI may well be Linux. Without this, every checkout rewrites endings and git
+# reports whole files as modified. Text files are stored as LF and checked out
+# as LF everywhere, so a diff shows real changes only.
+* text=auto eol=lf
+
+# Binary assets: never touch these.
+*.wav binary
+*.png binary
+*.ico binary
+*.pyc binary

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echochamber-speakerid"
+version = "0.1.0"
+description = "Low-latency audio ingestion producing overlapping windows for speaker identification"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Deployment target is Windows ARM64. Before adding any dependency with a
+# compiled extension, confirm a win_arm64 wheel exists -- this already ruled out
+# soxr, which is why the pipeline relies on WASAPI's own resampling instead.
+dependencies = [
+    "numpy>=2.0",
+    "sounddevice>=0.5.5",
+    "PySide6>=6.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4.5",
+]
+
+[project.scripts]
+echochamber = "echochamber.app:main"
+
+[tool.setuptools.packages.find]
+include = ["echochamber*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Keeps the repo importable without an editable install; harmless once installed.
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
