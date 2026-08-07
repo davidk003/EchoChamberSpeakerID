@@ -71,6 +71,29 @@ including what has *not* yet been verified on real ARM64 hardware.
 Recognition is pluggable and absent by default: with no vosk and no model, the gate is
 inert and the entire test suite still passes.
 
+### Announcing detections
+
+The gate can push events to a WebSocket listener (`pip install .[notify]`):
+
+```python
+NotifyConfig(enabled=True, url="ws://127.0.0.1:8765", include_audio=True)
+```
+
+Two events per utterance. `detected` goes out **the moment the phrase is recognized**;
+`snippet` follows when the file closes — `post_roll_ms` later — and carries the WAV when
+`include_audio` is set. They share a `seq`, so a listener can pair them:
+
+```json
+{"type":"detected","phrase":"ok google","text":"ok google turn it up","seq":0,"sample_rate":16000,"timestamp":1786122719.665}
+{"type":"snippet","phrase":"ok google","seq":0,"path":"...","frames":16000,"duration_s":1.0,"truncated":false,"audio":{"encoding":"base64","format":"wav","bytes":32044,"data":"..."}}
+```
+
+Sending happens on its own thread behind a bounded queue — a socket write to a dead host
+takes a TCP timeout to fail, and doing that on the consumer thread would stall the
+pipeline and drop audio. A listener that cannot keep up costs counted, visible dropped
+events instead. Best-effort only: no acknowledgement, no redelivery, and queued events are
+discarded at shutdown.
+
 ## Two things that will bite you
 
 **WASAPI will not resample unless you ask it to.** A 16 kHz request on a 48 kHz device fails

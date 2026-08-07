@@ -382,12 +382,59 @@ JSON was rejected: audio is the bulk of the traffic and raw `int16` PCM contains
 constantly, so a line protocol would need escaping or base64, inflating the hot path by a
 third to solve a problem an explicit length does not have.
 
+### Announcing detections over a WebSocket
+
+The gate can tell a listener when a phrase is heard. Two event kinds, because
+**detection and recording finish at different times**: a phrase is recognised at one
+instant, but its snippet is not closed until `post_roll_ms` later — three seconds by
+default. Sending only on completion would make a "wake word detected" signal arrive three
+seconds late; sending only on detection would never carry the audio. So `DETECTED` goes
+out immediately with no audio, `SNIPPET` follows with the WAV when `include_audio` is set,
+and the two share a `seq` so a listener can pair them. A *suppressed* duplicate produces
+no `DETECTED` — those are the same utterance re-reported, which is what the cooldown is
+for.
+
+**The binding constraint is that `notify()` runs on the consumer thread.** A socket send
+to an unreachable host takes a TCP timeout to fail, and for that whole time the queue
+would not be drained, chunks would be discarded under `DROP_OLDEST`, and the gate would go
+deaf to the audio it was discarding — a network problem silently becoming an audio
+problem. So `notify()` appends to a bounded deque and returns; a `voicegate-notify` thread
+does the connecting and writing. A full buffer discards the **oldest** event and counts
+it, the same policy and the same reasoning as `QueueSink` (§3.4): a notifier that cannot
+keep up must cost visible dropped events rather than invisible dropped audio.
+
+Reconnection backs off from `reconnect_initial_s` to `reconnect_max_s` and resets on a
+successful send — a client that reconnects as fast as it can fail is indistinguishable
+from a denial-of-service. The backoff waits on a condition rather than sleeping, so
+`close()` stays bounded even with a 30 s retry in flight. An event whose send fails is
+**requeued**, not dropped: the socket being down is precisely when a listener most wants
+the events it missed.
+
+`websocket-client` is the transport. Unlike vosk it is **pure Python** — a `py3-none-any`
+wheel — so it carries no ARM64 packaging risk whatsoever and installs on the deployment
+target directly. It is still an optional extra (`pip install .[notify]`), imported lazily,
+behind a `Transport` protocol whose default sends nothing: opening a network connection is
+not something a capture tool should begin doing because a feature was merged.
+
+`NotifyRelay` adapts the sink's callbacks rather than either side knowing about the other.
+The sink is a recorder, and gating audio has nothing to do with sockets; putting the
+translation in the GUI controller instead would have made it the one piece of this feature
+untestable without Qt.
+
 ### Honest limitations
 
 - **A dropped chunk is a hole in the snippet.** The gate sits downstream of the bounded
   queue, so under `DROP_OLDEST` it never sees audio the queue discarded. `chunks_dropped`
   being non-zero means snippet audio may be missing, exactly as it does for
   `WavRecorderSink`'s `gaps`.
+- **Notifications are best-effort and unordered relative to nothing.** There is no
+  acknowledgement, no redelivery, and no persistence: `close()` deliberately discards
+  whatever is still queued, because a notification arriving after the capture it describes
+  has ended is worth less than exiting promptly. Anything that needs delivery guarantees
+  wants a broker, not this.
+- **`wss://` verifies certificates by whatever `websocket-client` defaults to**; no
+  pinning, no custom CA handling, and credentials go in `NotifyConfig.headers` as plain
+  strings held in memory for the process's life.
 - **The gate cannot be verified on ARM64 from this repository.** The subprocess design is
   sound and the protocol is tested, but nothing here has executed against a real x64
   venv on real Windows ARM64 hardware. That validation is outstanding.
@@ -421,6 +468,8 @@ echochamber/
     recognizer.py        # Recognizer protocol, Null/Scripted/Vosk backends
     snippets.py          # PreRollBuffer, SnippetWriter, snippet_filename
     sink.py              # VoiceGateSink: the gate itself
+    notify.py            # NotifyConfig, WebSocketNotifier, Transport protocol
+    relay.py             # adapts gate callbacks to notifications
     protocol.py          # length-prefixed frames for the worker pipe
     subprocess_recognizer.py  # x64 worker bridge (the ARM64 workaround)
     worker.py            # child-process entry point; runs inside the x64 venv
@@ -465,6 +514,19 @@ max_snippet_ms = 15_000  # ceiling on an extended snippet
 cooldown_ms  = 1000      # refractory period after a snippet closes
 snippet_dir  = "snippets"
 worker_python = None     # None = in-process; a path = x64 subprocess backend
+```
+
+Notifications (`NotifyConfig`), also off by default:
+
+```python
+enabled      = False     # opening a socket is opt-in
+url          = "ws://127.0.0.1:8765"
+events       = {DETECTED, SNIPPET}
+include_audio = False    # a 4.5 s snippet is ~250 KB once base64'd
+max_audio_bytes = 4 MiB  # a larger file is sent WITHOUT audio, never truncated
+queue_max    = 32        # then drop-oldest, counted
+reconnect_initial_s = 1.0
+reconnect_max_s     = 30.0
 ```
 
 ## 6. Testing

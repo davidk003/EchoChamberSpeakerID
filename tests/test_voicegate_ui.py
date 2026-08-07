@@ -22,7 +22,9 @@ user intent would drive an endless round trip.
 
 from __future__ import annotations
 
+import json
 import os
+import time
 import wave
 
 import numpy as np
@@ -44,6 +46,12 @@ from echochamber.voicegate.backends import (
     describe_backend,
 )
 from echochamber.voicegate.config import VoiceGateConfig
+from echochamber.voicegate.notify import (
+    EventKind,
+    NotifyConfig,
+    NullTransport,
+    RecordingTransport,
+)
 from echochamber.voicegate.recognizer import (
     NullRecognizer,
     Recognition,
@@ -135,6 +143,28 @@ def _scripted_builder(script, backend: str = "in-process"):
         return RecognizerChoice(ScriptedRecognizer(list(script)), backend)
 
     return builder
+
+
+def _wait_until(predicate, timeout: float = 3.0) -> bool:
+    """Poll ``predicate`` until it holds or ``timeout`` expires.
+
+    Args:
+        predicate: Zero-argument callable returning something truthy when the
+            wait is over.
+        timeout: Seconds to wait.
+
+    Returns:
+        ``True`` if the predicate held in time.  Returned rather than asserted
+        so a caller can produce a failure message naming what it was waiting
+        for; never sleeps a fixed interval, so the tests stay fast and do not
+        depend on how quickly a background thread is scheduled.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return bool(predicate())
 
 
 def _stats(**overrides) -> UiStats:
@@ -368,6 +398,219 @@ class TestControllerGateWiring:
         """A None config is refused rather than replacing a working one."""
         controller = CaptureController(voice_gate=VoiceGateConfig())
         assert controller.set_voice_gate(None) is False
+
+
+class TestControllerNotifyWiring:
+    """The controller starts, feeds and stops the notifier."""
+
+    def test_notifications_off_start_no_notifier(self, tmp_path) -> None:
+        """The default opens no socket and starts no thread."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 1.0)
+        controller = CaptureController(
+            config=AudioConfig(window_ms=500, hop_ms=250),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder([]),
+        )
+        assert controller.start()
+        try:
+            assert controller.notifier is None
+            assert controller.poll().notify_enabled is False
+        finally:
+            controller.stop()
+
+    def test_a_detection_and_its_snippet_both_reach_the_transport(
+        self, tmp_path
+    ) -> None:
+        """Both events go out, and they share a seq so a listener can pair them."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 4.0)
+        transport = RecordingTransport()
+        controller = CaptureController(
+            config=AudioConfig(
+                window_ms=1000, hop_ms=500, drop_policy=DropPolicy.BLOCK
+            ),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder(
+                [(32_000, Recognition("ok google turn it up", final=True))]
+            ),
+            notify=NotifyConfig(enabled=True, url="ws://127.0.0.1:1"),
+            transport_builder=lambda config: (transport, None),
+        )
+        assert controller.start()
+        try:
+            assert controller.pipeline is not None
+            controller.pipeline.wait_until_finished(timeout=30)
+            assert _wait_until(lambda: len(transport.messages) >= 2)
+        finally:
+            controller.stop()
+
+        payloads = [json.loads(text) for text in transport.messages]
+        kinds = [payload["type"] for payload in payloads]
+        assert kinds == [EventKind.DETECTED.value, EventKind.SNIPPET.value]
+        assert payloads[0]["seq"] == payloads[1]["seq"]
+        assert payloads[0]["phrase"] == "ok google"
+        assert payloads[1]["path"] is not None
+        # The detection is announced before the snippet exists, so it must not
+        # be carrying snippet fields.
+        assert "duration_s" not in payloads[0]
+        assert payloads[1]["duration_s"] > 0.0
+
+    def test_notify_counters_reach_ui_stats(self, tmp_path) -> None:
+        """What the notifier did is visible without reaching into it."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 4.0)
+        transport = RecordingTransport()
+        controller = CaptureController(
+            config=AudioConfig(
+                window_ms=1000, hop_ms=500, drop_policy=DropPolicy.BLOCK
+            ),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder(
+                [(32_000, Recognition("ok google", final=True))]
+            ),
+            notify=NotifyConfig(enabled=True, url="ws://127.0.0.1:1"),
+            transport_builder=lambda config: (transport, None),
+        )
+        assert controller.start()
+        try:
+            assert controller.pipeline is not None
+            controller.pipeline.wait_until_finished(timeout=30)
+            assert _wait_until(lambda: controller.poll().notify_sent >= 2)
+            stats = controller.poll()
+            assert stats.notify_enabled is True
+            assert stats.notify_connected is True
+            assert stats.notify_dropped == 0
+        finally:
+            controller.stop()
+
+    def test_a_missing_transport_package_does_not_fail_the_capture(
+        self, tmp_path
+    ) -> None:
+        """An optional package that is absent is a note, not a failed start."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 1.0)
+        messages: list[str] = []
+        controller = CaptureController(
+            config=AudioConfig(window_ms=500, hop_ms=250),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder([]),
+            notify=NotifyConfig(enabled=True, url="ws://127.0.0.1:1"),
+            transport_builder=lambda config: (
+                NullTransport(),
+                "install websocket-client",
+            ),
+        )
+        controller.error_occurred.connect(messages.append)
+        assert controller.start()
+        try:
+            assert controller.state is CaptureState.RUNNING
+            assert controller.notifier is None
+            assert any("websocket-client" in text for text in messages)
+        finally:
+            controller.stop()
+
+    def test_stop_closes_the_notifier(self, tmp_path) -> None:
+        """A notifier must not outlive the run that created it."""
+        wav = _write_wav(str(tmp_path / "in.wav"), 1.0)
+        transport = RecordingTransport()
+        controller = CaptureController(
+            config=AudioConfig(window_ms=500, hop_ms=250),
+            source_factory_builder=_file_factory_builder(wav),
+            voice_gate=_gate_config(tmp_path),
+            recognizer_builder=_scripted_builder([]),
+            notify=NotifyConfig(enabled=True, url="ws://127.0.0.1:1"),
+            transport_builder=lambda config: (transport, None),
+        )
+        assert controller.start()
+        notifier = controller.notifier
+        assert notifier is not None
+        controller.stop()
+
+        assert controller.notifier is None
+        assert notifier.closed
+        assert transport.closed
+
+
+class TestNotifyRendering:
+    """The panel makes a notifier that is not delivering anything visible."""
+
+    def test_notifications_off_render_a_dash(self, qtbot) -> None:
+        """An unused feature shows nothing rather than a misleading zero."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(_stats(notify_enabled=False))
+        assert panel.value_label("notify_state").text() == "off"
+        assert panel.value_label("notify_sent").text() == "—"
+
+    def test_a_connected_notifier_reads_connected(self, qtbot) -> None:
+        """The happy path says so plainly."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(
+            _stats(notify_enabled=True, notify_connected=True, notify_sent=3)
+        )
+        assert panel.value_label("notify_state").text() == "connected"
+        assert panel.value_label("notify_sent").text() == "3"
+        assert panel.value_label("notify_state").styleSheet() == ""
+
+    def test_a_down_listener_is_shown_as_connecting_and_flagged(
+        self, qtbot
+    ) -> None:
+        """The sender retries forever, so this is a state, not a dead end."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(_stats(notify_enabled=True, notify_connected=False))
+        assert panel.value_label("notify_state").text() == "connecting"
+        assert panel.value_label("notify_state").styleSheet() != ""
+
+    def test_dropped_events_are_named_not_merely_omitted(self, qtbot) -> None:
+        """A notifier discarding everything must not look like a quiet one."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(
+            _stats(
+                notify_enabled=True,
+                notify_connected=True,
+                notify_sent=5,
+                notify_dropped=2,
+            )
+        )
+        text = panel.value_label("notify_sent").text()
+        assert "5" in text and "2 dropped" in text
+        assert panel.value_label("notify_sent").styleSheet() != ""
+
+    def test_a_backlog_is_named(self, qtbot) -> None:
+        """Queued events explain why sent is lower than detections."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(
+            _stats(notify_enabled=True, notify_connected=True, notify_queued=4)
+        )
+        assert "4 queued" in panel.value_label("notify_sent").text()
+
+    def test_a_notify_error_reaches_the_note(self, qtbot) -> None:
+        """A transport failure is surfaced, not swallowed."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(
+            _stats(notify_enabled=True, notify_error="ConnectionError: refused")
+        )
+        assert "refused" in panel.note_label.text()
+        assert panel.note_label.styleSheet() != ""
+
+    def test_a_gate_error_outranks_a_notify_error(self, qtbot) -> None:
+        """A deaf gate is the more urgent problem; only one note fits."""
+        panel = VoiceGatePanel()
+        qtbot.addWidget(panel)
+        panel.update_stats(
+            _stats(
+                gate_error="recognition failed",
+                notify_enabled=True,
+                notify_error="ConnectionError: refused",
+            )
+        )
+        assert "recognition failed" in panel.note_label.text()
 
 
 class TestPhraseFieldParsing:
