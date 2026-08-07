@@ -19,6 +19,13 @@ Testing strategy worth stating up front:
   *and* ``len(snapshot())``, because the two are maintained separately -- a
   running total and a deque -- and a bug that desynchronises them would be
   invisible to either assertion alone.
+* **:attr:`~PreRollBuffer.appended` is the buffer's clock**, and the tests for
+  :meth:`~PreRollBuffer.extract` are written against a *reference* copy of the
+  whole appended stream rather than against remembered literals.  A range is
+  therefore asserted to be the bytes that really occupied those offsets, which
+  is the property the gate depends on when it cuts a wake phrase out of the
+  past; comparing against a hand-copied literal would only prove the test and
+  the buffer agree about what was appended.
 """
 
 from __future__ import annotations
@@ -275,6 +282,287 @@ class TestPreRollBufferClear:
         buf.clear()
         buf.clear()
         assert buf.size == 0
+
+
+class TestPreRollBufferAppended:
+    """appended is the stream clock: every byte ever appended, evicted or not."""
+
+    def test_a_fresh_buffer_has_appended_nothing(self) -> None:
+        """The clock starts at zero, so the first byte sits at offset 0."""
+        buf = PreRollBuffer(100)
+        assert buf.appended == 0
+        assert buf.oldest == 0
+
+    def test_appended_counts_every_byte(self) -> None:
+        """It counts what arrived, not what is still held."""
+        buf = PreRollBuffer(100)
+        buf.append(b"abc")
+        buf.append(b"de")
+
+        assert buf.appended == 5
+        assert buf.appended == buf.size, "nothing was evicted, so the two agree"
+
+    def test_appended_keeps_counting_past_the_capacity(self) -> None:
+        """Evicted bytes still happened; forgetting them would rewind the clock.
+
+        A clock that stopped at the capacity would make every offset the gate
+        holds mean something different once the buffer filled -- which is
+        immediately, in a running pipeline.
+        """
+        buf = PreRollBuffer(4)
+        buf.append(b"abcd")
+        buf.append(b"efgh")
+        buf.append(b"ij")
+
+        assert buf.appended == 10
+        assert buf.size == 4, "only the newest four bytes are retained"
+
+    def test_an_oversized_append_counts_all_of_itself(self) -> None:
+        """The bytes that were never retained were still appended."""
+        buf = PreRollBuffer(4)
+        buf.append(b"abcdefghij")
+
+        assert buf.appended == 10
+        assert buf.size == 4
+
+    @pytest.mark.parametrize("chunk", [b"a", b"abc", b"x" * 100])
+    def test_a_zero_capacity_buffer_still_counts(self, chunk: bytes) -> None:
+        """A black hole still has a clock, so a caller's offsets stay meaningful."""
+        buf = PreRollBuffer(0)
+        buf.append(chunk)
+
+        assert buf.appended == len(chunk)
+        assert buf.size == 0
+        assert buf.oldest == len(chunk), (
+            "nothing is retained, so the oldest retained byte is one past the end"
+        )
+
+    def test_an_empty_append_does_not_move_the_clock(self) -> None:
+        """A no-op append must not advance offsets nobody's bytes occupy."""
+        buf = PreRollBuffer(10)
+        buf.append(b"abc")
+        buf.append(b"")
+
+        assert buf.appended == 3
+
+    @pytest.mark.parametrize("capacity", [0, 1, 4, 16, 1000])
+    def test_oldest_is_appended_minus_size(self, capacity: int) -> None:
+        """The invariant, held across a long run of appends of varying sizes."""
+        buf = PreRollBuffer(capacity)
+        for n in range(1, 20):
+            buf.append(bytes([n % 256]) * n)
+            assert buf.oldest == buf.appended - buf.size, (
+                f"oldest={buf.oldest} disagrees with appended={buf.appended} "
+                f"minus size={buf.size}"
+            )
+            assert buf.oldest >= 0
+
+    def test_appended_appears_in_the_repr(self) -> None:
+        """The repr is for debugging a gate that located the wrong offsets."""
+        buf = PreRollBuffer(4)
+        buf.append(b"abcdef")
+        assert "appended=6" in repr(buf)
+
+    def test_clear_resets_the_clock(self) -> None:
+        """After a discontinuity the offsets on either side are not one stream.
+
+        Keeping the count would let a caller holding a pre-discontinuity offset
+        ask for a range that :meth:`extract` would happily satisfy out of audio
+        recorded after the seam.
+        """
+        buf = PreRollBuffer(10)
+        buf.append(b"abcde")
+        buf.clear()
+
+        assert buf.appended == 0
+        assert buf.oldest == 0
+
+    def test_the_clock_restarts_from_zero_after_a_clear(self) -> None:
+        """Audio from after the seam is offset from the seam, not from the start."""
+        buf = PreRollBuffer(10)
+        buf.append(b"abcde")
+        buf.clear()
+        buf.append(b"xyz")
+
+        assert buf.appended == 3
+        assert buf.oldest == 0
+        assert buf.extract(0, 3) == b"xyz"
+
+
+class TestPreRollBufferExtract:
+    """extract() is how the gate cuts a wake phrase out of the retained past."""
+
+    def test_a_fully_retained_range_comes_back_verbatim(self) -> None:
+        """The headline case: exact bytes for exact offsets."""
+        buf = PreRollBuffer(100)
+        buf.append(b"hello world")
+
+        assert buf.extract(0, 5) == b"hello"
+        assert buf.extract(6, 11) == b"world"
+
+    def test_a_range_inside_one_chunk(self) -> None:
+        """The cheap path: no join is needed, and the slice must still be right."""
+        buf = PreRollBuffer(100)
+        buf.append(b"abc")
+        buf.append(b"defghi")
+
+        assert buf.extract(4, 6) == b"ef"
+
+    def test_a_range_spanning_several_chunks(self) -> None:
+        """Audio arrives one chunk per hop; a phrase spans however many it takes."""
+        buf = PreRollBuffer(100)
+        for part in (b"ab", b"cd", b"ef", b"gh"):
+            buf.append(part)
+
+        assert buf.extract(1, 7) == b"bcdefg", (
+            "the range must be stitched across the chunk boundaries it crosses"
+        )
+
+    def test_the_whole_retained_range_is_the_snapshot(self) -> None:
+        """``extract(oldest, appended)`` and ``snapshot()`` describe the same bytes."""
+        buf = PreRollBuffer(6)
+        for part in (b"aaa", b"bbb", b"ccc"):
+            buf.append(part)
+
+        assert buf.extract(buf.oldest, buf.appended) == buf.snapshot()
+        assert buf.extract(3, 9) == b"bbbccc"
+
+    def test_a_single_byte_range(self) -> None:
+        """The smallest useful range; an off-by-one here would be silent."""
+        buf = PreRollBuffer(100)
+        buf.append(b"abcdef")
+
+        assert buf.extract(0, 1) == b"a"
+        assert buf.extract(5, 6) == b"f"
+
+    @pytest.mark.parametrize(("start", "end"), [(0, 0), (3, 3), (4, 2), (5, 0)])
+    def test_an_empty_or_backwards_range_is_refused(
+        self, start: int, end: int
+    ) -> None:
+        """``b""`` would read as "the phrase is here and it is silent"."""
+        buf = PreRollBuffer(100)
+        buf.append(b"abcdef")
+
+        assert buf.extract(start, end) is None
+
+    def test_a_range_that_has_been_evicted_is_refused(self) -> None:
+        """The bytes are gone; the offsets now hold different audio entirely."""
+        buf = PreRollBuffer(4)
+        buf.append(b"abcdef")                    # keeps "cdef", oldest == 2
+
+        assert buf.oldest == 2, "test setup"
+        assert buf.extract(0, 4) is None, (
+            "offsets 0 and 1 were evicted, so the range must be refused rather "
+            "than served from offset 2 onwards"
+        )
+        assert buf.extract(1, 3) is None
+        assert buf.extract(2, 6) == b"cdef", "the retained part is still readable"
+
+    def test_a_range_that_has_not_arrived_is_refused(self) -> None:
+        """The future is not buffered, however little of it is being asked for."""
+        buf = PreRollBuffer(100)
+        buf.append(b"abcdef")
+
+        assert buf.extract(0, 7) is None
+        assert buf.extract(6, 8) is None
+        assert buf.extract(0, 6) == b"abcdef", "the boundary itself is fine"
+
+    def test_a_partial_range_is_refused_rather_than_clipped(self) -> None:
+        """Half a wake phrase sounds like a different word, so it is not returned."""
+        buf = PreRollBuffer(8)
+        buf.append(b"0123456789")                # keeps "23456789"
+
+        assert buf.extract(1, 5) is None, (
+            "one byte of the range was evicted; the surviving three must not be "
+            "returned as though they were the whole thing"
+        )
+
+    def test_an_empty_buffer_refuses_everything(self) -> None:
+        """Before any audio there is nothing to cut."""
+        buf = PreRollBuffer(100)
+
+        assert buf.extract(0, 1) is None
+        assert buf.extract(0, 0) is None
+
+    def test_a_zero_capacity_buffer_refuses_everything(self) -> None:
+        """The black hole retains nothing, so no range is ever satisfiable."""
+        buf = PreRollBuffer(0)
+        buf.append(b"abcdef")
+
+        assert buf.extract(0, 6) is None
+        assert buf.extract(5, 6) is None
+
+    def test_a_range_across_a_partially_consumed_head_chunk(self) -> None:
+        """Eviction trims the head mid-chunk; extract must count from the trim.
+
+        This is the case where the walk over the deque and the offsets can
+        disagree: the first chunk no longer starts where it was appended, so a
+        cursor that began at the chunk's original offset would return bytes
+        shifted by however much was trimmed off it.
+        """
+        buf = PreRollBuffer(10)
+        buf.append(b"abcde")
+        buf.append(b"fghij")
+        buf.append(b"klm")                       # trims "abc" off the head
+
+        assert buf.size == 10, "test setup: the head was partially consumed"
+        assert buf.oldest == 3
+        assert buf.snapshot() == b"defghijklm"
+
+        assert buf.extract(3, 7) == b"defg", (
+            "the range starts inside the trimmed head and runs into the next "
+            "chunk"
+        )
+        assert buf.extract(3, 5) == b"de", "wholly inside the trimmed head"
+        assert buf.extract(4, 13) == b"efghijklm"
+        assert buf.extract(2, 7) is None, "offset 2 was trimmed away"
+
+    def test_a_range_after_an_oversized_append(self) -> None:
+        """An append larger than the capacity replaces the deque outright."""
+        buf = PreRollBuffer(4)
+        buf.append(b"abc")
+        buf.append(b"defghij")                   # keeps "ghij", oldest == 6
+
+        assert buf.oldest == 6
+        assert buf.extract(6, 10) == b"ghij"
+        assert buf.extract(5, 10) is None
+
+    def test_every_valid_range_matches_the_appended_stream(self) -> None:
+        """Exhaustive: each retained range is compared against a reference copy.
+
+        The reference is the concatenation of everything appended, so this
+        asserts the buffer's offsets mean what the gate assumes -- a position in
+        the stream -- rather than merely being self-consistent.
+        """
+        capacity = 12
+        buf = PreRollBuffer(capacity)
+        stream = bytearray()
+        for n in range(1, 10):
+            part = bytes((n * 31 + i) % 251 for i in range(n))
+            buf.append(part)
+            stream.extend(part)
+
+            assert buf.appended == len(stream)
+            for start in range(buf.oldest, buf.appended):
+                for end in range(start + 1, buf.appended + 1):
+                    assert buf.extract(start, end) == bytes(stream[start:end]), (
+                        f"extract({start}, {end}) disagrees with the appended "
+                        f"stream after {buf.appended} bytes"
+                    )
+
+    def test_extract_does_not_disturb_the_buffer(self) -> None:
+        """Reading is not consuming: the same range can be cut twice."""
+        buf = PreRollBuffer(10)
+        buf.append(b"abcde")
+        buf.append(b"fghij")
+
+        first = buf.extract(2, 8)
+
+        assert first == b"cdefgh"
+        assert buf.extract(2, 8) == first
+        assert buf.size == 10
+        assert buf.appended == 10
+        assert buf.snapshot() == b"abcdefghij"
 
 
 class TestSnippetWriter:

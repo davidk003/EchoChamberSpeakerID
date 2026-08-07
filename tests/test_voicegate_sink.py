@@ -984,8 +984,15 @@ class TestExtension:
 class TestTruncation:
     """max_snippet_ms is a hard ceiling, not a suggestion."""
 
-    def test_a_tiny_ceiling_truncates_the_snippet(self, tmp_path: Path) -> None:
-        """The file stops at the ceiling and says so, in the counter and the event."""
+    def test_a_single_snippet_cannot_reach_the_ceiling(self, tmp_path: Path) -> None:
+        """One un-extended snippet is pre-roll plus post-roll, and validation
+        already bounds that below the ceiling -- so it closes normally.
+
+        This used to truncate, but only because the writer overshot to a chunk
+        boundary instead of stopping at the post-roll.  With the write trimmed,
+        the ceiling is unreachable without an extension, which is what it exists
+        to bound.
+        """
         config = _config(
             tmp_path, pre_roll_ms=0, post_roll_ms=500, max_snippet_ms=600
         )
@@ -994,17 +1001,38 @@ class TestTruncation:
 
         _feed(sink, 3)
 
-        ceiling = config.max_snippet_frames(SR)
-        assert ceiling == 9_600, "test setup: 600 ms at 16 kHz"
-        assert sink.snippets_truncated >= 1, (
-            "a snippet cut by the ceiling must be counted as truncated"
+        assert sink.snippets_truncated == 0
+        assert events[0].truncated is False
+
+        _, _, _, nframes, _ = _read_wav(_wavs(config)[0])
+        assert nframes == config.post_roll_frames(SR), (
+            "post_roll_ms must be exact, not 'at least, rounded up to a hop'"
         )
+
+    def test_an_extended_snippet_is_cut_at_the_ceiling(self, tmp_path: Path) -> None:
+        """The file stops at the ceiling and says so, in the counter and the event.
+
+        Repeated matches push the post-roll out indefinitely, which is precisely
+        the runaway ``max_snippet_ms`` is there to stop.
+        """
+        config = _config(
+            tmp_path, pre_roll_ms=0, post_roll_ms=1500, max_snippet_ms=2000
+        )
+        events: list[SnippetEvent] = []
+        sink, _ = _make_sink(
+            config,
+            [(_bytes_after(0), _final()), (_bytes_after(1), _final())],
+            events,
+        )
+
+        _feed(sink, 4)
+
+        ceiling = config.max_snippet_frames(SR)
+        assert ceiling == 32_000, "test setup: 2000 ms at 16 kHz"
+        assert sink.snippets_truncated == 1
         assert events[0].truncated is True
 
         _, _, _, nframes, _ = _read_wav(_wavs(config)[0])
-        assert nframes <= ceiling, (
-            f"the snippet ran to {nframes} frames, past the {ceiling}-frame ceiling"
-        )
         assert nframes == ceiling, (
             "the trim must be exact rather than 'within one hop of the ceiling'"
         )

@@ -585,13 +585,22 @@ class VoiceGateSink:
             self._reset_recognizer()
             self._pre_roll.clear()
             self._anchor_fed = self._fed_frames
-            self._anchor_abs = chunk.start_frame
+            # Cleared rather than set to this chunk's start: the recogniser is
+            # fed the *de-overlapped tail*, which begins a whole overlap later,
+            # and anchoring to the window's start would place every subsequent
+            # clip `window - hop` too early -- 2000 ms in the shipping geometry,
+            # inside the lookback and so invisible to the sanity check.  The
+            # re-anchor is deferred to the branch below, which already computes
+            # that position correctly, so there is exactly one expression for
+            # "where the audio the recogniser sees begins".
+            self._anchor_abs = None
 
         if n_new <= 0:
             return
 
         if self._anchor_abs is None:
-            # First audio: the recogniser's clock starts here.
+            # First audio, or the first after a seam: the recogniser's clock
+            # starts at the beginning of the tail actually fed to it.
             self._anchor_abs = chunk.start_frame + chunk.n_frames - n_new
 
         tail = chunk.samples[chunk.n_frames - n_new :]
@@ -656,7 +665,7 @@ class VoiceGateSink:
 
     def _locate_phrase(
         self, found: PhraseMatch, recognition: Recognition
-    ) -> tuple[int, int] | None:
+    ) -> tuple[int, int, bool] | None:
         """Map a matched phrase onto absolute stream frames, or give up.
 
         Vosk reports per-word times counted from the first sample it was ever
@@ -678,8 +687,10 @@ class VoiceGateSink:
             recognition: The result it came from.
 
         Returns:
-            ``(start_frame, end_frame)`` in absolute stream frames, padded by
-            ``lead_ms`` and ``trail_ms``, or ``None`` to fall back to a window.
+            ``(start_frame, end_frame, capped)`` in absolute stream frames,
+            padded by ``lead_ms`` and ``trail_ms``, with ``capped`` set when the
+            length ceiling shortened the span; or ``None`` to fall back to a
+            window.
         """
         if self._clip_mode is not ClipMode.PHRASE or self._anchor_abs is None:
             return None
@@ -703,9 +714,10 @@ class VoiceGateSink:
         # the future, and streaming fills that in.
         if start < oldest or start >= current:
             return None
-        if end - start > self._max_snippet_frames:
+        capped = end - start > self._max_snippet_frames
+        if capped:
             end = start + self._max_snippet_frames
-        return start, end
+        return start, end, capped
 
     def _open_snippet(
         self, found: PhraseMatch, text: str, recognition: Recognition
@@ -748,7 +760,7 @@ class VoiceGateSink:
         located = self._locate_phrase(found, recognition)
 
         if located is not None:
-            start_frame, end_frame = located
+            start_frame, end_frame, capped = located
             available_end = min(end_frame, current)
             byte_start = self._pre_roll.appended - (current - start_frame) * _BYTES_PER_FRAME
             byte_end = self._pre_roll.appended - (current - available_end) * _BYTES_PER_FRAME
@@ -757,11 +769,14 @@ class VoiceGateSink:
                 with self._lock:
                     self._clips_located += 1
                 self._snippet_start_frame = start_frame
-                written = writer.write(audio)
+                writer.write(audio)
                 # Whatever of the trailing pad has not been captured yet.
                 self._post_roll_left = max(0, end_frame - available_end)
                 if self._post_roll_left == 0:
-                    self._close_snippet(truncated=False)
+                    # `capped` when the ceiling shortened the span: audio the
+                    # caller asked for is genuinely absent from the file, which
+                    # is exactly what the truncation counter reports.
+                    self._close_snippet(truncated=capped)
                 else:
                     self._check_snippet_limits()
                 return
@@ -797,14 +812,22 @@ class VoiceGateSink:
         if allowed <= 0:
             self._close_snippet(truncated=True)
             return
-        if frames > allowed:
+
+        # Never write past the snippet's end.  Chunks arrive a hop at a time and
+        # the end almost never lands on one, so writing the whole chunk and
+        # letting the counter go negative overshoots by up to a hop -- 1000 ms
+        # in the shipping geometry, on a clip whose entire purpose is to be the
+        # hotword and little else.  In WINDOW mode this is what makes
+        # ``post_roll_ms`` exact rather than "at least".
+        wanted = min(frames, max(0, self._post_roll_left))
+        if wanted > allowed:
             # Trim so the ceiling is exact rather than "within one hop of it";
             # a snippet that overran its configured maximum would make the
             # setting a suggestion.
             self._post_roll_left -= writer.write(pcm[: allowed * _BYTES_PER_FRAME])
             self._close_snippet(truncated=True)
             return
-        self._post_roll_left -= writer.write(pcm)
+        self._post_roll_left -= writer.write(pcm[: wanted * _BYTES_PER_FRAME])
         self._check_snippet_limits()
 
     def _check_snippet_limits(self) -> None:
