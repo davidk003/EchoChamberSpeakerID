@@ -14,15 +14,85 @@ the rate rather than properties assuming one.
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 
 from echochamber.config import ms_to_frames
 from echochamber.voicegate.matching import normalize
 
-__all__ = ["DEFAULT_PHRASES", "VoiceGateConfig"]
+__all__ = [
+    "DEFAULT_PHRASES",
+    "VoiceGateConfig",
+    "autodetect_model_path",
+    "autodetect_voice_gate_config",
+    "autodetect_worker_python",
+]
 
 DEFAULT_PHRASES: tuple[str, ...] = ("ok google", "hey google")
 """Phrases the gate listens for out of the box."""
+
+_VENV_DIR: str = ".venv-vosk"
+"""Where :mod:`scripts.setup_voice_gate` builds the recogniser environment."""
+
+_MODEL_DIR: str = "models"
+"""Where :mod:`scripts.setup_voice_gate` unpacks the model."""
+
+_MODEL_NAME: str = "vosk-model-small-en-us-0.15"
+"""Must match ``scripts.setup_voice_gate.MODEL_NAME``."""
+
+_REPO_ROOT: str = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+"""Repository root, derived from this file's location rather than the
+current working directory -- the app can be launched from anywhere, but the
+venv and model :mod:`scripts.setup_voice_gate` created are always siblings of
+this package, not of whatever directory the user happened to be in."""
+
+
+def _venv_python(venv_dir: str) -> str:
+    """Return the interpreter path inside a virtual environment.
+
+    Mirrors ``scripts.setup_voice_gate.venv_python``; duplicated rather than
+    imported because that script is a standard-library-only bootstrapper and
+    must not depend on this package.
+    """
+    if os.name == "nt":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python")
+
+
+def autodetect_model_path(root: str | None = None) -> str | None:
+    """Find the Vosk model :mod:`scripts.setup_voice_gate` would have unpacked.
+
+    Args:
+        root: Directory to look under; the repository root when ``None``.
+
+    Returns:
+        The model directory's absolute path if it exists, else ``None`` --
+        callers treat that exactly like a user who left ``model_path`` unset.
+    """
+    base = _REPO_ROOT if root is None else root
+    candidate = os.path.join(base, _MODEL_DIR, _MODEL_NAME)
+    return candidate if os.path.isdir(candidate) else None
+
+
+def autodetect_worker_python(root: str | None = None) -> str | None:
+    """Find the x64 recogniser venv :mod:`scripts.setup_voice_gate` would have built.
+
+    Only relevant to the subprocess backend; a machine where vosk installs
+    directly (anywhere but Windows ARM64) has no reason to have this venv, and
+    :func:`~echochamber.voicegate.backends.build_recognizer` uses the
+    in-process backend when ``worker_python`` is unset.
+
+    Args:
+        root: Directory to look under; the repository root when ``None``.
+
+    Returns:
+        The venv's interpreter path if it exists, else ``None``.
+    """
+    base = _REPO_ROOT if root is None else root
+    candidate = _venv_python(os.path.join(base, _VENV_DIR))
+    return candidate if os.path.isfile(candidate) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,3 +275,30 @@ class VoiceGateConfig:
                 phrase.
         """
         return dataclasses.replace(self, enabled=bool(enabled))
+
+
+def autodetect_voice_gate_config(**overrides: object) -> VoiceGateConfig:
+    """Build a :class:`VoiceGateConfig` with ``model_path``/``worker_python``
+    filled in from what :mod:`scripts.setup_voice_gate` left on disk.
+
+    ``VoiceGateConfig()`` itself defaults both to ``None`` -- deliberately,
+    since the dataclass has no business knowing about the filesystem, and the
+    test suite pins those defaults (see ``tests/test_voicegate_config.py``).
+    This is the seam callers who *do* want the filesystem consulted use
+    instead: the application's entry point, not the config type. Detected
+    values only fill in fields the caller did not already pass in
+    ``overrides`` -- an explicit ``model_path=None`` still means "no model",
+    not "go detect one".
+
+    Args:
+        **overrides: Passed through to :class:`VoiceGateConfig`, taking
+            precedence over anything detected.
+
+    Returns:
+        A validated :class:`VoiceGateConfig`.
+    """
+    if "model_path" not in overrides:
+        overrides["model_path"] = autodetect_model_path()
+    if "worker_python" not in overrides:
+        overrides["worker_python"] = autodetect_worker_python()
+    return VoiceGateConfig(**overrides)

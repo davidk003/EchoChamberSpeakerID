@@ -56,7 +56,7 @@ from echochamber.voicegate.backends import (
     build_recognizer,
     describe_backend,
 )
-from echochamber.voicegate.config import VoiceGateConfig
+from echochamber.voicegate.config import VoiceGateConfig, autodetect_voice_gate_config
 from echochamber.voicegate.notify import (
     NotifyConfig,
     NotifyStats,
@@ -424,9 +424,15 @@ class CaptureController(QObject):
             sd_module: Module to use instead of the real :mod:`sounddevice`,
                 threaded through both enumeration and the default builder.
             parent: Qt parent, or ``None``.
-            voice_gate: Wake-phrase gate configuration; a disabled default
-                :class:`~echochamber.voicegate.config.VoiceGateConfig` when
-                ``None``, which costs nothing and wires no extra sink.
+            voice_gate: Wake-phrase gate configuration.  When ``None``, a
+                default :class:`~echochamber.voicegate.config.VoiceGateConfig`
+                is built with ``model_path`` and ``worker_python``
+                autodetected from what
+                :mod:`scripts.setup_voice_gate` left on disk (see
+                :func:`~echochamber.voicegate.config.autodetect_voice_gate_config`)
+                -- so a machine that has run the setup script gets a working
+                gate without editing code, and one that has not gets the
+                inert default it always got, at no extra cost.
             recognizer_builder: Callable returning a
                 :class:`~echochamber.voicegate.backends.RecognizerChoice`,
                 called with ``(config, sample_rate)`` at :meth:`start`.
@@ -456,7 +462,7 @@ class CaptureController(QObject):
         )
         self._sd_module: Any = sd_module
         self._voice_gate_config: VoiceGateConfig = (
-            VoiceGateConfig() if voice_gate is None else voice_gate
+            autodetect_voice_gate_config() if voice_gate is None else voice_gate
         )
         self._recognizer_builder: Callable[..., RecognizerChoice] = (
             build_recognizer if recognizer_builder is None else recognizer_builder

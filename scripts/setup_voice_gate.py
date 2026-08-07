@@ -126,6 +126,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not create the venv or install vosk",
     )
+    parser.add_argument(
+        "--trusted-host",
+        action="append",
+        dest="trusted_hosts",
+        default=[],
+        metavar="HOST",
+        help=(
+            "pass-through to `pip install --trusted-host`; repeat for "
+            "multiple hosts. Needed when pip's TLS verification fails with "
+            "CERTIFICATE_VERIFY_FAILED / self-signed certificate in chain -- "
+            "typically a corporate TLS-inspecting proxy. Try "
+            "--trusted-host pypi.org --trusted-host files.pythonhosted.org"
+        ),
+    )
     return parser
 
 
@@ -225,7 +239,9 @@ def check_architecture(python: str) -> bool:
     return True
 
 
-def create_venv(python: str, venv_dir: str) -> str:
+def create_venv(
+    python: str, venv_dir: str, trusted_hosts: Sequence[str] = ()
+) -> str:
     """Create ``venv_dir`` from ``python`` and install Vosk into it.
 
     The venv is created by *running the target interpreter*, not by calling
@@ -239,6 +255,11 @@ def create_venv(python: str, venv_dir: str) -> str:
     Args:
         python: Interpreter to build the environment from.
         venv_dir: Directory for the environment.
+        trusted_hosts: Hosts passed to ``pip install --trusted-host``, for
+            networks where pip's TLS verification fails against
+            ``pypi.org`` -- typically a corporate proxy that terminates TLS
+            with its own certificate, which is not in this interpreter's
+            trust store.
 
     Returns:
         Path to the interpreter inside the new environment -- the value to
@@ -260,9 +281,26 @@ def create_venv(python: str, venv_dir: str) -> str:
                 f"no interpreter at {target!r}"
             )
 
-    print("Installing vosk (this pulls ~40 MB of wheels) ...")
-    _run([target, "-m", "pip", "install", "--upgrade", "pip"], "upgrade pip")
-    _run([target, "-m", "pip", "install", "vosk"], "install vosk")
+    trust_args: list[str] = []
+    for host in trusted_hosts:
+        trust_args += ["--trusted-host", host]
+
+    print("Installing vosk and numpy (this pulls ~50 MB of wheels) ...")
+    _run(
+        [target, "-m", "pip", "install", "--upgrade", "pip", *trust_args],
+        "upgrade pip",
+    )
+    # numpy is not needed to *decode* audio, but importing
+    # `echochamber.voicegate.worker` pulls in the whole `echochamber` package
+    # tree (voicegate.config -> echochamber.config -> echochamber.audio,
+    # which imports numpy at module scope), so the worker cannot start
+    # without it. This venv is always x64 -- unlike the main ARM64
+    # environment -- so the ordinary win_amd64 wheel applies with no
+    # architecture caveat.
+    _run(
+        [target, "-m", "pip", "install", "vosk", "numpy>=2.3", *trust_args],
+        "install vosk and numpy",
+    )
     return target
 
 
@@ -354,7 +392,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.skip_venv:
             print("Skipping the virtual environment (--skip-venv).")
         else:
-            worker_python = create_venv(args.python, args.venv_dir)
+            worker_python = create_venv(
+                args.python, args.venv_dir, args.trusted_hosts
+            )
 
         if args.skip_model:
             print("Skipping the model download (--skip-model).")
