@@ -14,7 +14,9 @@ license = { text = "Proprietary" }
 # compiled extension, confirm a win_arm64 wheel exists -- this already ruled out
 # soxr, which is why the pipeline relies on WASAPI's own resampling instead.
 dependencies = [
-    "numpy>=2.0",
+    # numpy's first win_arm64 wheel is 2.3.0; anything looser lets the ARM64
+    # target install a numpy that was never tested here.
+    "numpy>=2.3",
     "sounddevice>=0.5.5",
     "PySide6>=6.11",
 ]

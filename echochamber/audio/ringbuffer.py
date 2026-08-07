@@ -200,6 +200,50 @@ class RingBuffer:
         q = start_frame % self._capacity
         return self._buf[q : q + n]
 
+    def read_copy(self, start_frame: int, n: int) -> np.ndarray:
+        """Return an owned copy of ``n`` frames, verified against a lapping writer.
+
+        **Use this, not** :meth:`read`, **for anything you keep.**
+
+        :meth:`read` validates and then hands back a view.  That validation is
+        already stale by the time it returns: the producer keeps running, and if
+        it laps the ring while the caller is copying, the caller ends up holding
+        the wrong audio with no error raised anywhere -- data labelled with a
+        ``start_frame`` that does not describe it.  Silently misaligned audio is
+        far worse than missing audio, because nothing downstream can detect it.
+
+        This is the classic seqlock read: copy first, then re-check that the
+        region was still valid for the whole copy, and discard the result if it
+        was not.  The re-check is one integer comparison.
+
+        Consumer thread only.
+
+        Args:
+            start_frame: Absolute index of the first frame requested.
+            n: Number of frames, at most :attr:`capacity`.
+
+        Returns:
+            A newly allocated array of ``n`` frames that no writer can touch.
+
+        Raises:
+            ValueError: As :meth:`read`.
+            OverrunError: If the frames were already gone, *or* if the writer
+                lapped them while this call was copying.
+        """
+        out = self.read(start_frame, n).copy()
+
+        # Re-read the cursor AFTER the copy. If the writer has since advanced
+        # far enough to have overwritten any part of what we just read, the
+        # copy is untrustworthy -- treat it exactly like any other overrun.
+        if start_frame < self._write_frames - self._capacity:
+            raise OverrunError(
+                f"writer lapped frames [{start_frame}, {start_frame + n}) while "
+                f"they were being copied; write_frames={self._write_frames}, "
+                f"capacity={self._capacity}. The copy was discarded rather than "
+                f"returned as valid audio"
+            )
+        return out
+
     def available_from(self, start_frame: int) -> int:
         """Return how many frames are readable from ``start_frame`` onward.
 
@@ -235,8 +279,14 @@ class RingBuffer:
             if self._closed:
                 return False
             event.clear()
-            if self._write_frames >= end_frame:  # re-check AFTER clear
+            # Both conditions must be re-checked after clear(), not just the
+            # frame count: a close() landing in the gap sets the event, clear()
+            # then discards that wakeup, and with timeout=None the waiter would
+            # block forever on a ring that is already closed.
+            if self._write_frames >= end_frame:
                 return True
+            if self._closed:
+                return False
             if not event.wait(timeout):
                 return False
 

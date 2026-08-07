@@ -315,3 +315,28 @@ def test_stop_survives_a_stream_that_already_died(
 
     assert src.stop(timeout=1.0) is True, "stop() must not raise on a dead stream"
     assert src.finished.is_set()
+
+
+def test_peak_and_rms_are_actually_different_measurements(
+    sd: FakeSounddevice, collector: list
+) -> None:
+    """A constant signal has peak == RMS, so it cannot tell the two apart.
+
+    Every earlier level test fed a constant block, which meant a peak meter and
+    an RMS meter were indistinguishable. This uses a crest factor far from 1:
+    a single full-scale sample in an otherwise silent block.
+    """
+    stats = StreamStats()
+    src = make_source(sd, collector, stats=stats)
+    src.start()
+
+    block = np.zeros(100, dtype=np.float32)
+    block[0] = 1.0
+    last_stream().feed(block)
+
+    assert stats.peak_level == pytest.approx(1.0), "peak must be the maximum"
+    assert stats.rms_level == pytest.approx(0.1), "rms of one full-scale in 100 is 0.1"
+    assert stats.peak_level != pytest.approx(stats.rms_level), (
+        "peak and rms must be distinguishable measurements"
+    )
+    src.stop()

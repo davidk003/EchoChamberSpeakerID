@@ -1157,3 +1157,25 @@ def test_an_object_with_only_on_chunk_does_not_satisfy_chunksink() -> None:
     assert not isinstance(HalfASink(), ChunkSink), (
         "close() is part of the protocol -- the pipeline calls it on stop()"
     )
+
+
+def test_wav_recorder_close_releases_the_file_handle(tmp_path: Any) -> None:
+    """close() must actually close the WAV, not merely set a flag.
+
+    Windows will not allow an open file to be replaced, so os.replace is a
+    direct probe for a leaked handle. Under CPython refcounting a leak is
+    invisible until something holds a reference -- which is exactly when it
+    would start truncating recordings in the field.
+    """
+    import os
+
+    path = tmp_path / "recorded.wav"
+    sink = WavRecorderSink(path, 16000)
+    sink.on_chunk(
+        AudioChunk(np.full(128, 0.25, np.float32), 0, 0, 16000)
+    )
+    sink.close()
+
+    other = tmp_path / "other.wav"
+    other.write_bytes(b"placeholder")
+    os.replace(other, path)  # raises PermissionError on Windows if still open

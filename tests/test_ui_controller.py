@@ -1162,3 +1162,39 @@ def test_a_dead_pipeline_stops_the_poll_timer(
         f"{len(collected) - settled} more times over {QUIET_S}s"
     )
     assert controller.stop() is True
+
+
+# --------------------------------------------------------------------------
+# Poll timer configuration
+#
+# Both of these are stated architectural requirements that nothing asserted.
+# With Qt's default CoarseTimer the 33 ms interval is rounded to the Windows
+# scheduler tick and runs at ~21 Hz instead of 30 -- a third of the UI frames
+# silently missing, with nothing to indicate why.
+# --------------------------------------------------------------------------
+
+
+def test_poll_timer_is_precise_not_coarse() -> None:
+    from PySide6.QtCore import Qt
+
+    from echochamber.ui.controller import CaptureController
+
+    controller = CaptureController()
+    try:
+        assert controller.poll_timer.timerType() == Qt.TimerType.PreciseTimer, (
+            "a CoarseTimer rounds the 33 ms poll to the Windows scheduler tick "
+            "and delivers ~21 Hz instead of the specified 30 Hz"
+        )
+    finally:
+        controller.stop()
+
+
+def test_poll_interval_is_the_specified_30hz() -> None:
+    from echochamber.ui.controller import POLL_INTERVAL_MS, CaptureController
+
+    assert POLL_INTERVAL_MS == 33, "the architecture specifies ~30 Hz GUI updates"
+    controller = CaptureController()
+    try:
+        assert controller.poll_timer.interval() == POLL_INTERVAL_MS
+    finally:
+        controller.stop()

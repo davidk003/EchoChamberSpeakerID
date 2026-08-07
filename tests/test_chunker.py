@@ -1358,3 +1358,182 @@ def test_repr_reflects_a_reconfigured_geometry() -> None:
 
     text = repr(ch)
     assert "window_frames=50" in text and "hop_frames=25" in text
+
+
+# ==========================================================================
+# Overruns against a LIVE writer
+#
+# The existing overrun tests quiesce the producer before letting the chunker
+# proceed, which makes them deterministic but means no test ever exercised the
+# case that actually matters: the writer still running while the chunker reads.
+# That gap hid real corruption -- chunks were emitted holding audio from a
+# later lap of the ring while reporting the original start_frame, and the
+# following chunk was not even flagged discontinuous.
+#
+# The invariant asserted here is the one the whole project promises: whatever
+# chunk you receive, its samples ARE the audio at its start_frame. Losing audio
+# is acceptable; misreporting it is not.
+# ==========================================================================
+
+# float32 represents consecutive integers exactly only below 2**24. Past that
+# the ramp itself stops being a reliable oracle, so the writer is bounded and
+# each test asserts it stayed inside the range.
+FLOAT32_EXACT_INT_MAX = 2 ** 24
+RAMP_LIMIT = 8_000_000
+
+
+def test_no_chunk_ever_misreports_its_audio_under_live_overruns() -> None:
+    """Fast writer, slow consumer, tight ring: drops are fine, lies are not."""
+    # sample_rate=1000 keeps 1 ms == 1 frame. Ring of 2400 holds only 1.5
+    # windows, so a slow consumer is lapped almost immediately.
+    cfg = make_config(1600, 400, sample_rate=1000, ring_seconds=2.4)
+    W = cfg.window_frames
+
+    corrupt: list[str] = []
+    ring = RingBuffer(cfg.ring_frames)
+
+    def on_chunk(chunk: AudioChunk) -> None:
+        # samples[i] == absolute frame index, so chunk k must start at k*H.
+        expected = float(chunk.start_frame)
+        actual = float(chunk.samples[0])
+        if actual != expected:
+            corrupt.append(
+                f"seq={chunk.seq} start_frame={chunk.start_frame} "
+                f"first_sample={actual:.0f} expected={expected:.0f} "
+                f"delta={actual - expected:+.0f} "
+                f"discontinuous={chunk.discontinuous}"
+            )
+        time.sleep(0.002)  # guarantee the writer laps us
+
+    ch = WindowChunker(ring, cfg, on_chunk)
+    ch.start()
+
+    stop = threading.Event()
+
+    def writer() -> None:
+        n = 0
+        while not stop.is_set() and n < RAMP_LIMIT:
+            ring.write(np.arange(n, n + 160, dtype=np.float32))
+            n += 160
+        ring.close()
+
+    producer = threading.Thread(target=writer, daemon=True)
+    producer.start()
+    try:
+        time.sleep(1.5)
+    finally:
+        stop.set()
+        producer.join(timeout=5.0)
+        ch.stop(timeout=5.0)
+
+    assert ch.stats.overruns > 0, (
+        "the setup did not actually overrun, so this proves nothing"
+    )
+    assert ring.write_frames <= FLOAT32_EXACT_INT_MAX, (
+        "the ramp exceeded float32's exact-integer range, so a mismatch would "
+        "mean rounding rather than corruption"
+    )
+    assert not corrupt, (
+        f"{len(corrupt)} chunk(s) reported audio they do not contain:\n  "
+        + "\n  ".join(corrupt[:5])
+    )
+
+
+def test_every_emitted_window_is_internally_contiguous_under_live_overruns() -> None:
+    """Not just the first sample: the whole window must be one run of audio."""
+    cfg = make_config(800, 200, sample_rate=1000, ring_seconds=1.2)
+    W = cfg.window_frames
+
+    broken: list[str] = []
+    ring = RingBuffer(cfg.ring_frames)
+
+    def on_chunk(chunk: AudioChunk) -> None:
+        expected = np.arange(
+            chunk.start_frame, chunk.start_frame + W, dtype=np.float32
+        )
+        if not np.array_equal(chunk.samples, expected):
+            bad = int(np.argmax(chunk.samples != expected))
+            broken.append(
+                f"seq={chunk.seq} start_frame={chunk.start_frame} "
+                f"first mismatch at index {bad}: "
+                f"{chunk.samples[bad]:.0f} != {expected[bad]:.0f}"
+            )
+        time.sleep(0.002)
+
+    ch = WindowChunker(ring, cfg, on_chunk)
+    ch.start()
+
+    stop = threading.Event()
+
+    def writer() -> None:
+        n = 0
+        while not stop.is_set() and n < RAMP_LIMIT:
+            ring.write(np.arange(n, n + 160, dtype=np.float32))
+            n += 160
+        ring.close()
+
+    producer = threading.Thread(target=writer, daemon=True)
+    producer.start()
+    try:
+        time.sleep(1.5)
+    finally:
+        stop.set()
+        producer.join(timeout=5.0)
+        ch.stop(timeout=5.0)
+
+    assert ch.stats.overruns > 0, "the setup did not actually overrun"
+    assert ring.write_frames <= FLOAT32_EXACT_INT_MAX, (
+        "the ramp exceeded float32's exact-integer range"
+    )
+    assert not broken, (
+        f"{len(broken)} window(s) contain spliced audio:\n  " + "\n  ".join(broken[:5])
+    )
+
+
+class _LappingRing(RingBuffer):
+    """A ring whose producer *always* laps between validation and the copy.
+
+    The corruption this guards against is a genuine race, and a probabilistic
+    test for it is worthless: it passes against the broken code most of the
+    time. Forcing the writer to run inside `read()` makes the window certain,
+    so this test fails against `read().copy()` every single run.
+    """
+
+    def read(self, start_frame: int, n: int) -> np.ndarray:
+        view = super().read(start_frame, n)
+        for _ in range(2):
+            super().write(np.full(self.capacity, -999.0, dtype=np.float32))
+        return view
+
+
+def test_chunker_never_emits_audio_a_lapping_writer_overwrote() -> None:
+    """The chunker must discard a copy the writer invalidated, not emit it.
+
+    Emitting it produces audio labelled with a start_frame that does not
+    describe it -- undetectable downstream, and worse than dropping the window.
+    """
+    cfg = make_config(400, 200, sample_rate=1000, ring_seconds=1.2)
+    ring = _LappingRing(cfg.ring_frames)
+    collector = Collector()
+
+    ch = WindowChunker(ring, cfg, collector)
+    ch.start()
+    try:
+        write_ramp(ring, 0, cfg.window_frames + cfg.hop_frames * 4)
+        time.sleep(0.4)
+    finally:
+        ring.close()
+        ch.stop(timeout=5.0)
+
+    bad = [
+        f"seq={c.seq} start_frame={c.start_frame} first_sample={c.samples[0]:.0f}"
+        for c in collector.snapshot()
+        if float(c.samples[0]) != float(c.start_frame)
+    ]
+    assert not bad, (
+        "the chunker emitted audio the writer had already overwritten:\n  "
+        + "\n  ".join(bad[:5])
+    )
+    assert ch.stats.overruns > 0, (
+        "the lapping ring should have produced counted overruns"
+    )

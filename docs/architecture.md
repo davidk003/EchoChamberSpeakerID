@@ -30,8 +30,11 @@ Target platform: Windows, Python 3.11, PySide6 GUI.
 | Sink API | `ChunkSink` protocol | Lets the queue be swapped for a process/network sink later without touching capture. |
 
 **Non-negotiable rule:** the PortAudio callback runs on a real-time-ish thread. It must never
-allocate, never lock, never log, and never touch Qt. Violating this causes xruns (dropouts),
-not just slowness.
+block, never log, and never touch Qt. Keep allocation to the unavoidable minimum: in practice
+the callback does one `copy()` of the device block, computes peak/RMS, and calls
+`Event.set()` (which briefly takes an uncontended lock) — measured at 0 xruns over multi-second
+runs, but it is not literally allocation-free, and anything heavier belongs downstream.
+Violating the spirit of this causes xruns (dropouts), not just slowness.
 
 > **WASAPI will not resample unless you ask it to.** Measured on real hardware (Intel mic
 > array, 48 kHz native, PortAudio 19.7):
@@ -63,11 +66,16 @@ not just slowness.
  Chunker thread            (windowing: window W, hop H)
         │  emits AudioChunk(samples, start_frame, seq, sample_rate)
         ▼
-   TeeSink ──┬──► QueueSink  (bounded, maxsize ~8) ──► consumer thread → [future ML]
-             ├──► WavRecorderSink  (optional, debug / ground truth)
-             └──► MeterSink  (updates an atomic stats snapshot)
+   QueueSink  (bounded, maxsize ~8)
+        │  consumer thread drains it
+        ▼
+   sink   (one ChunkSink; use TeeSink to fan out to a recorder, a stub consumer, …)
                           ▲
- GUI thread ──────────────┘  QTimer @ 30 Hz polls the snapshot. No per-chunk signals.
+ GUI thread ──────────────┘  QTimer @ 30 Hz polls a stats snapshot. No per-chunk signals.
+
+Levels are computed in `AudioSource._emit`, the only place raw audio is seen; there is no
+separate meter sink. `AudioPipeline` wires exactly one sink — `TeeSink` is available but not
+used by default.
 ```
 
 Three threads, one queue, one ring buffer. Nothing else crosses a thread boundary.
@@ -78,20 +86,31 @@ Three threads, one queue, one ring buffer. Nothing else crosses a thread boundar
 
 ### 3.1 RingBuffer (`audio/ringbuffer.py`)
 
-Single-producer / single-consumer, preallocated `np.empty(capacity, float32)`. Capacity ≈ 10 s,
-which is ~640 KB at 16 kHz — cheap, and large enough to absorb a GUI hitch without loss.
+Single-producer / single-consumer, preallocated `np.zeros(2 * capacity, float32)` — twice the
+nominal capacity because of the doubled-write layout below. A 10 s ring at 16 kHz is therefore
+~1.28 MB, still cheap, and large enough to absorb a GUI hitch without loss.
 
 **Contiguous-read trick:** allocate `2 * capacity` and write every block twice (at `i` and
 `i + capacity`). Reads of any window ≤ capacity are then always a contiguous slice — no
 wraparound branch, no stitching, and the chunker can hand out a plain `np.ndarray` view.
 Cost is one extra memcpy of a 10 ms block in the callback; negligible.
 
-State shared across threads is exactly one monotonically increasing `write_frames` counter
-(a Python int assignment, which is atomic under the GIL). The consumer never writes it.
+The hot path shares exactly one monotonically increasing `write_frames` counter (a Python int
+assignment, atomic under the GIL); the consumer never writes it. A closed flag and an `Event`
+are also shared, but only on the shutdown path, and both must be re-checked after
+`Event.clear()` — missing that on the flag once left `wait_for(timeout=None)` able to block
+forever on an already-closed ring.
 
 Overrun detection: if the reader falls more than `capacity` behind the writer, samples were
 lost. Detect on read, count it, resynchronize the read cursor to the oldest valid sample, and
 mark the next chunk `discontinuous=True` so downstream knows not to trust continuity.
+
+**Validating before the copy is not enough.** `read()` returns a view, so its check is already
+stale when it returns: a writer that laps the ring while the consumer is copying yields the
+wrong audio under a `start_frame` that does not describe it, with nothing raised. Silently
+misaligned windows are worse than missing ones — nothing downstream can detect them. `read_copy()`
+is therefore a seqlock read: copy, then re-check that the region survived, and raise `OverrunError`
+if it did not. Anything that keeps its data must use `read_copy`, never `read().copy()`.
 
 ### 3.2 Chunker (`audio/chunker.py`)
 
@@ -107,7 +126,7 @@ Chunk `k` covers absolute frames `[k*H, k*H + W)`. The loop is:
 next_start = 0
 while running:
     wait until ring.write_frames >= next_start + W
-    samples = ring.read(next_start, W)        # contiguous view, then copy
+    samples = ring.read_copy(next_start, W)   # seqlock read: copy, then re-verify
     emit AudioChunk(samples, start_frame=next_start, seq=k, ...)
     next_start += H
 ```
@@ -115,9 +134,9 @@ while running:
 Because `start_frame` is derived from a counter and never from a wall clock, chunk boundaries
 are **sample-exact and drift-free** regardless of scheduler jitter.
 
-**Copy semantics:** `read()` returns a view into the ring; the chunker copies it before
-emitting, because the writer will eventually overwrite that region. For W = 3 s @ 16 kHz that
-is a 192 KB memcpy per hop — microseconds. Do not try to avoid it.
+**Copy semantics:** the chunker uses `read_copy()`, which copies and then re-verifies that the
+writer did not lap the region mid-copy (see §3.1). For W = 3 s @ 16 kHz that is a 192 KB memcpy
+per hop — microseconds. Do not try to avoid it, and do not downgrade it to `read().copy()`.
 
 **Live reconfiguration:** `window_ms` / `hop_ms` live in a frozen dataclass held in a single
 attribute; the GUI swaps the whole object atomically. The chunker re-reads it at the top of
@@ -157,11 +176,11 @@ Overhead budget beyond `window_ms`:
 
 | Stage | Cost |
 |---|---|
-| WASAPI shared-mode device buffer | ~10 ms (blocksize 160 @ 16 kHz) |
+| WASAPI shared-mode device buffer | ~22 ms measured (blocksize 160 @ 16 kHz) |
 | Ring write + read | < 0.1 ms |
 | Chunker wake-up jitter | ~1–2 ms (Windows timer granularity) |
 | Queue put/get | < 0.1 ms |
-| **Total added** | **~12 ms** |
+| **Total added** | **~25 ms measured** |
 
 So a 3000 ms window / 1000 ms hop config produces a chunk every second, each ~3.01 s behind
 the leading edge of the *oldest* audio it contains. If perceived latency is too high, the lever
@@ -196,7 +215,8 @@ out of view still happened.
 
 ### 3.4 Backpressure (`audio/sinks.py`)
 
-`QueueSink` wraps a `queue.Queue(maxsize=8)` with an explicit policy:
+`QueueSink` is a bounded buffer (a `collections.deque` plus a `Condition` — `queue.Queue` cannot
+discard its own head, which `DROP_OLDEST` requires) with an explicit policy:
 
 - `DROP_OLDEST` (default, live): if full, discard the head and enqueue the new chunk. Freshness
   beats completeness for real-time classification. Increment `dropped_chunks`.
@@ -256,8 +276,10 @@ PySide6. The audio path never calls into Qt directly.
   N ms (P %)" readout, level meter, scrolling waveform, and a stats panel showing dropped
   chunks and the latency histogram.
 
-Waveform rendering pulls a decimated view from the ring buffer on the timer tick — the GUI is
-a *reader* of the same ring, never a sink that can block the pipeline.
+Waveform data is decimated in `LatestChunkSink.on_chunk` on the consumer thread, from the
+chunk's own samples, and the GUI reads the latest snapshot on its timer tick. The GUI never
+touches the ring buffer — keeping it a single-consumer structure, which is what the lock-free
+design depends on.
 
 ---
 
@@ -267,8 +289,10 @@ a *reader* of the same ring, never a sink that can block the pipeline.
 echochamber/
   config.py              # AudioConfig frozen dataclass, defaults, ms→samples helpers
   audio/
-    types.py             # AudioChunk, StreamStats, DropPolicy
-    ringbuffer.py        # SPSC ring, doubled-write contiguous reads
+    types.py             # AudioChunk (incl. capture_time), StreamStats, DropPolicy
+    ringbuffer.py        # SPSC ring, doubled-write contiguous reads, seqlock read_copy
+    latency.py           # LatencyTracker / LatencySummary percentiles
+    stub_consumer.py     # StubInferenceSink: stands in for the ML stage
     chunker.py           # WindowChunker thread
     sinks.py             # ChunkSink protocol, QueueSink, TeeSink, WavRecorderSink
     devices.py           # input device enumeration

@@ -256,3 +256,19 @@ def test_chunker_stamps_capture_time_from_perf_counter() -> None:
         f"(perf_counter now={_time.perf_counter()}, "
         f"monotonic now={_time.monotonic()})"
     )
+
+
+def test_percentile_uses_ceil_not_floor_where_they_differ() -> None:
+    """Pins the rank rule at an n where the two definitions disagree.
+
+    With 10 sorted samples, ceil(0.95*10) is rank 10 and floor is rank 9. The
+    previous implementation used round(f*n + 0.5) and returned the wrong one;
+    every earlier test used n=100 where several rules happen to agree.
+    """
+    t = LatencyTracker()
+    t.record_many([n / 1000.0 for n in range(1, 11)])  # 1..10 ms
+    s = t.summary()
+
+    assert s.p95_ms == pytest.approx(10.0), "p95 of 10 samples is the 10th"
+    assert s.p99_ms == pytest.approx(10.0)
+    assert s.p50_ms == pytest.approx(5.0), "p50 of 10 samples is the 5th"

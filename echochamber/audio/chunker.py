@@ -292,7 +292,11 @@ class WindowChunker:
                     continue
 
                 try:
-                    samples = ring.read(next_start, window_frames).copy()
+                    # read_copy, not read().copy(): the latter validates before
+                    # copying, so a writer lapping the ring mid-copy yields the
+                    # wrong audio under a start_frame that lies about it, with
+                    # nothing raised. read_copy re-checks after the copy.
+                    samples = ring.read_copy(next_start, window_frames)
                 except OverrunError:
                     # The writer lapped us; those frames are gone for good.
                     stats.overruns += 1

@@ -44,7 +44,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from echochamber.audio.devices import DeviceInfo, list_input_devices
-from echochamber.audio.latency import LatencyTracker
+from echochamber.audio.latency import LatencySummary, LatencyTracker
 from echochamber.audio.pipeline import AudioPipeline, SourceFactory
 from echochamber.audio.sources.sounddevice_source import SoundDeviceSource
 from echochamber.audio.types import AudioChunk, StreamStats

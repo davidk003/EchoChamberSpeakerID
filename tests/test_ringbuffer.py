@@ -636,3 +636,112 @@ def test_spsc_overrun_is_detected_when_the_consumer_falls_behind() -> None:
 
     with pytest.raises(OverrunError):
         rb.read(0, 100)          # the consumer never moved off frame 0
+
+
+# ==========================================================================
+# read_copy: the seqlock read
+#
+# read() validates and then returns a view, so its validation is already stale
+# by the time the caller copies. A writer lapping the ring during that copy
+# produced the wrong audio under a start_frame that lied about it, with nothing
+# raised anywhere. Silently misaligned audio is worse than missing audio because
+# nothing downstream can detect it.
+#
+# Every test below writes in the gap explicitly rather than racing for it, so
+# these cannot become flaky-but-passing.
+# ==========================================================================
+
+
+def test_read_returns_a_view_that_a_lapping_writer_corrupts() -> None:
+    """Documents exactly why read_copy exists. read() alone is not safe to keep."""
+    ring = RingBuffer(1000)
+    ring.write(np.arange(0, 500, dtype=np.float32))
+
+    view = ring.read(0, 500)
+    assert view[0] == 0.0
+
+    for _ in range(3):
+        ring.write(np.full(1000, -999.0, dtype=np.float32))
+
+    assert view[0] == -999.0, (
+        "read() hands back a live view; this is the hazard read_copy closes"
+    )
+
+
+class _LappingRing(RingBuffer):
+    """A ring whose writer always runs between validation and the copy.
+
+    Subclassed rather than monkeypatched because RingBuffer uses __slots__, and
+    this makes the race deterministic instead of something to spin for.
+    """
+
+    def read(self, start_frame: int, n: int) -> np.ndarray:
+        view = super().read(start_frame, n)
+        for _ in range(3):
+            super().write(np.full(self.capacity, -999.0, dtype=np.float32))
+        return view
+
+
+def test_read_copy_raises_when_the_writer_laps_during_the_copy() -> None:
+    ring = _LappingRing(1000)
+    ring.write(np.arange(0, 500, dtype=np.float32))
+
+    with pytest.raises(OverrunError):
+        ring.read_copy(0, 500)
+
+
+def test_read_copy_returns_an_owned_copy() -> None:
+    ring = RingBuffer(1000)
+    ring.write(np.arange(0, 500, dtype=np.float32))
+
+    out = ring.read_copy(0, 500)
+    assert out.base is None, "read_copy must return an owned array"
+
+    ring.write(np.full(1000, -1.0, dtype=np.float32))
+    assert out[0] == 0.0, "the copy must survive the writer lapping afterwards"
+
+
+def test_read_copy_matches_read_when_nothing_laps() -> None:
+    ring = RingBuffer(1000)
+    ring.write(np.arange(0, 900, dtype=np.float32))
+    assert np.array_equal(ring.read_copy(100, 500), np.arange(100, 600, dtype=np.float32))
+
+
+def test_read_copy_still_rejects_already_lost_frames() -> None:
+    ring = RingBuffer(100)
+    for start in (0, 100, 200):  # write() rejects blocks larger than capacity
+        ring.write(np.arange(start, start + 100, dtype=np.float32))
+    with pytest.raises(OverrunError):
+        ring.read_copy(0, 50)
+
+
+def test_wait_for_none_timeout_returns_when_close_races_the_clear() -> None:
+    """close() landing in the clear() gap must not strand an infinite waiter.
+
+    The event is set by close() and then discarded by clear(); without a second
+    _closed check the waiter blocks forever on an already-closed ring.
+    """
+    ring = RingBuffer(1000)
+    original_clear = ring._event.clear  # type: ignore[attr-defined]
+    fired = threading.Event()
+
+    def clear_then_close() -> None:
+        original_clear()
+        if not fired.is_set():
+            fired.set()
+            ring.close()      # exactly the racing close, made deterministic
+
+    ring._event.clear = clear_then_close  # type: ignore[attr-defined]
+
+    result: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: result.append(ring.wait_for(10_000, timeout=None)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive(), (
+        "wait_for(timeout=None) hung after a close() racing the event clear"
+    )
+    assert result == [False]
