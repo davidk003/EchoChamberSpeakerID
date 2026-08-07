@@ -294,20 +294,47 @@ alongside the existing sink with `TeeSink`, so nothing upstream of the queue cha
 the gate inherits the property that already matters most: a slow consumer costs *dropped
 chunks*, which are counted, rather than *lost audio*, which is not.
 
-### Pre-roll is not a nicety
+### The clip is cut to the phrase, using the decoder's word timings
 
 A recogniser only reports a phrase **after** it has consumed the audio containing it. By
-the time the gate learns that "ok google" was said, that audio is already in the past —
-so a snippet opened at the moment of the match begins *after* the phrase it is named for.
-`PreRollBuffer` keeps the last `pre_roll_ms` of PCM in a bounded deque and the snippet is
-seeded with it. The default 1500 ms covers a slowly spoken phrase plus lead-in.
+the time the gate learns that "ok google" was said, that audio is already in the past.
+The naive answer is a fixed window — keep the last N seconds, record N more — and that is
+what `ClipMode.WINDOW` still does. But it means the hotword sits *somewhere* inside a 4.5 s
+file with nothing to say where, which is not what "send the clip that triggered it" means.
 
-Post-roll is the mirror: recording continues `post_roll_ms` past the match. A second match
-while a snippet is open **extends** that deadline rather than opening a second file, and
-`max_snippet_ms` caps the result so a phrase repeated indefinitely cannot record
-indefinitely. `cooldown_ms` then suppresses matches for a moment after a snippet closes —
-small models routinely emit the same phrase twice across consecutive results, and without
-a refractory period that writes two near-identical files.
+Vosk reports per-word `start`/`end`, and those times are **cumulative over everything the
+recogniser has been fed** — `frame_offset_` accumulates in its `CleanUp()` and `Reset()`
+does not clear it. So a word's position in the stream is recoverable:
+
+```
+absolute_frame = anchor_abs + (word_seconds * rate - anchor_fed)
+```
+
+The anchor exists because the recogniser's clock counts *audio it received*, while the
+stream counts *audio that happened*. Those diverge whenever the gate skips a gap, so the
+anchor is re-taken on every discontinuity and the two are back in step.
+
+`ClipMode.PHRASE` (the default) then extracts exactly `[phrase_start - lead_ms,
+phrase_end + trail_ms]` out of the lookback buffer. Measured on a sample-index ramp: a
+phrase at 2.000–2.600 s with 250 ms padding yields a clip starting at frame 28000, length
+17600 — frame-exact, 1.10 s rather than 4.50 s.
+
+**The arithmetic is checked before it is trusted.** A computed span landing in the future,
+before the stream started, or outside the retained audio means an assumption here is wrong
+— a decoder whose clock does not behave as documented, a `lookback_ms` shorter than the
+reporting lag — and the gate falls back to the window rather than cutting confidently from
+the wrong moment. `clips_located` and `clips_fallback` report which path each snippet took,
+and that distinction is invisible anywhere else: **a fallback clip is a *wider* clip, not a
+missing one.** The snippet count still climbs, the file still plays, and only that counter
+says the audio is not the hotword it is named after.
+
+`lookback_ms` (8 s) is not how much ends up in the file — it is how far back the gate can
+reach, and it must comfortably exceed the decoder's reporting lag. It costs 256 KB.
+
+A second match while a snippet is open **extends** it rather than opening a second file,
+`max_snippet_ms` caps that, and `cooldown_ms` suppresses matches just after a snippet
+closes — small models routinely re-report the same phrase across consecutive results, and
+without a refractory period that writes two near-identical files.
 
 ### Only finals, never partials
 
@@ -508,8 +535,12 @@ Voice gate (`VoiceGateConfig`), all off by default:
 enabled      = False     # needs a model this repo does not ship
 phrases      = ("ok google", "hey google")
 model_path   = None      # -> NullRecognizer, gate never fires
-pre_roll_ms  = 1500      # must cover the phrase itself; see §3.7
-post_roll_ms = 3000
+clip_mode    = PHRASE    # cut to the hotword; WINDOW for the old fixed span
+lead_ms      = 250       # padding before the phrase
+trail_ms     = 250       # padding after it
+lookback_ms  = 8000      # how far back the gate can reach, NOT the clip length
+pre_roll_ms  = 1500      # WINDOW mode only
+post_roll_ms = 3000      # WINDOW mode only
 max_snippet_ms = 15_000  # ceiling on an extended snippet
 cooldown_ms  = 1000      # refractory period after a snippet closes
 snippet_dir  = "snippets"
@@ -522,7 +553,7 @@ Notifications (`NotifyConfig`), also off by default:
 enabled      = False     # opening a socket is opt-in
 url          = "ws://127.0.0.1:8765"
 events       = {DETECTED, SNIPPET}
-include_audio = False    # a 4.5 s snippet is ~250 KB once base64'd
+include_audio = True     # a phrase-cut clip is ~1 s, ~43 KB once base64'd
 max_audio_bytes = 4 MiB  # a larger file is sent WITHOUT audio, never truncated
 queue_max    = 32        # then drop-oldest, counted
 reconnect_initial_s = 1.0
