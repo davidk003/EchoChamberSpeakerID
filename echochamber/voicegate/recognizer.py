@@ -32,10 +32,49 @@ __all__ = [
     "Recognition",
     "Recognizer",
     "ScriptedRecognizer",
+    "WordTiming",
     "float32_to_pcm16",
     "load_vosk_recognizer",
     "parse_vosk_result",
+    "parse_word_timings",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class WordTiming:
+    """Where one recognised word sits in the audio.
+
+    **The times are cumulative over everything fed to the recogniser**, not
+    relative to the current utterance.  Vosk accumulates ``frame_offset_`` in
+    its ``CleanUp()`` and never clears it in ``Reset()``, so a word two minutes
+    into a stream reports ``start`` near 120.0.  That is what makes it possible
+    to locate a wake phrase in the ring of buffered audio rather than guessing
+    at a fixed offset -- see
+    :meth:`echochamber.voicegate.sink.VoiceGateSink._locate_phrase`.
+
+    Attributes:
+        word: The word, as the decoder spelled it.
+        start: Seconds from the first sample fed to the recogniser.
+        end: Seconds from the first sample fed to the recogniser.
+        conf: Model confidence for this word, ``0.0``-``1.0``.
+    """
+
+    word: str
+    start: float
+    end: float
+    conf: float = 0.0
+
+    @property
+    def duration_s(self) -> float:
+        """Length of this word in seconds, never negative."""
+        return max(0.0, self.end - self.start)
+
+    def __repr__(self) -> str:
+        """Return a debugging representation naming the word and its span."""
+        return (
+            f"{type(self).__name__}({self.word!r}, "
+            f"{self.start:.3f}-{self.end:.3f}s)"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +93,28 @@ class Recognition:
             reports one, ``0.0`` otherwise.  Informational; the gate does not
             threshold on it, because the small model's confidences are not
             calibrated well enough to be worth a knob.
+        words: Per-word timings when the backend reports them, in the order
+            they were spoken.  **This is what lets a snippet be cut to the wake
+            phrase itself** rather than to a fixed window around whenever the
+            decoder happened to finish; a backend that reports nothing here
+            makes the gate fall back to that window.  Empty for partials.
     """
 
     text: str
     final: bool
     confidence: float = 0.0
+    words: tuple[WordTiming, ...] = ()
+
+    @property
+    def span(self) -> tuple[float, float] | None:
+        """The seconds spanned by every word, or ``None`` without timings.
+
+        Returns:
+            ``(start, end)`` from the first and last word.
+        """
+        if not self.words:
+            return None
+        return self.words[0].start, self.words[-1].end
 
     def __repr__(self) -> str:
         """Return a debugging representation of the recognised text."""
@@ -272,23 +328,84 @@ def parse_vosk_result(payload: str, final: bool) -> Recognition:
     if not isinstance(text, str):
         text = ""
 
+    raw_words = parsed.get("result")
+    timings = parse_word_timings(raw_words)
+    # Confidence is averaged over the words that *reported* one, deliberately
+    # independent of whether their timings parsed.  Deriving it from `timings`
+    # instead would make a decoder that omits timestamps report every utterance
+    # at zero confidence -- a quality signal silently turned into a packaging
+    # signal.
     confidence = 0.0
-    words = parsed.get("result")
-    if isinstance(words, list) and words:
-        # `bool` is a subclass of `int`, so a JSON `true` would otherwise pass
-        # the numeric check and contribute a confidence of 1.0 -- the most
-        # confident value there is, from a field that carried no number at all.
+    if isinstance(raw_words, list):
         scores = [
-            float(word["conf"])
-            for word in words
-            if isinstance(word, dict)
-            and isinstance(word.get("conf"), (int, float))
-            and not isinstance(word.get("conf"), bool)
+            value
+            for entry in raw_words
+            if isinstance(entry, dict)
+            for value in (_as_float(entry.get("conf")),)
+            if value is not None
         ]
         if scores:
             confidence = sum(scores) / len(scores)
 
-    return Recognition(text=text, final=final, confidence=confidence)
+    return Recognition(
+        text=text, final=final, confidence=confidence, words=timings
+    )
+
+
+def parse_word_timings(raw: object) -> tuple[WordTiming, ...]:
+    """Build :class:`WordTiming` values from Vosk's ``result`` array.
+
+    Every field is coerced rather than trusted, and a word that cannot be read
+    is **skipped rather than defaulted**.  A word with a fabricated ``start`` of
+    ``0.0`` would place the wake phrase at the beginning of the stream, and the
+    gate would cut a snippet from entirely the wrong audio -- a silent, wrong
+    answer, which is worse than the missing-timings fallback.
+
+    Args:
+        raw: The ``result`` value from a Vosk JSON payload, if there was one.
+
+    Returns:
+        The timings, in the order given.  Empty when ``raw`` is not a list, is
+        empty, or contains nothing usable.
+    """
+    if not isinstance(raw, list):
+        return ()
+
+    timings: list[WordTiming] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        word = entry.get("word")
+        start = _as_float(entry.get("start"))
+        end = _as_float(entry.get("end"))
+        if not isinstance(word, str) or start is None or end is None:
+            continue
+        conf = _as_float(entry.get("conf"))
+        timings.append(
+            WordTiming(
+                word=word,
+                start=start,
+                end=max(start, end),
+                conf=0.0 if conf is None else conf,
+            )
+        )
+    return tuple(timings)
+
+
+def _as_float(value: object) -> float | None:
+    """Coerce a JSON number to a float, rejecting booleans.
+
+    Args:
+        value: The raw value.
+
+    Returns:
+        The number, or ``None`` if it was not one.  ``bool`` is a subclass of
+        ``int``, so a JSON ``true`` would otherwise pass as ``1.0`` -- a real
+        number from a field that carried none.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def load_vosk_recognizer(

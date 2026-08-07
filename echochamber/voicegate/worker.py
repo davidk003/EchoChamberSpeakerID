@@ -290,6 +290,17 @@ def _encode_result(result: Recognition) -> bytes:
     Args:
         result: What the recogniser produced.
 
+    Word timings are forwarded, not dropped.  They are what lets the parent cut
+    a snippet to the wake phrase itself, and this process is the **only** one
+    that can see them -- on the deployment target the parent cannot load Vosk at
+    all.  Omitting them here would leave the ARM64 build silently falling back
+    to a fixed window while the x86-64 one cut precisely, which is exactly the
+    class of difference that does not show up until someone listens to the
+    files from the machine that shipped.
+
+    Args:
+        result: What the recogniser produced.
+
     Returns:
         The compact JSON payload the parent reconstructs a
         :class:`~echochamber.voicegate.recognizer.Recognition` from.
@@ -299,6 +310,15 @@ def _encode_result(result: Recognition) -> bytes:
             "text": result.text,
             "final": bool(result.final),
             "confidence": float(result.confidence),
+            "words": [
+                {
+                    "word": timing.word,
+                    "start": float(timing.start),
+                    "end": float(timing.end),
+                    "conf": float(timing.conf),
+                }
+                for timing in result.words
+            ],
         }
     )
 

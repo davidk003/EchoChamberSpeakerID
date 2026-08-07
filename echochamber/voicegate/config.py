@@ -14,19 +14,41 @@ the rate rather than properties assuming one.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from echochamber.config import ms_to_frames
 from echochamber.voicegate.matching import normalize
 
 __all__ = [
     "DEFAULT_PHRASES",
+    "ClipMode",
     "VoiceGateConfig",
     "autodetect_model_path",
     "autodetect_voice_gate_config",
     "autodetect_worker_python",
 ]
+
+
+class ClipMode(enum.Enum):
+    """What a snippet is cut to.
+
+    Attributes:
+        PHRASE: The wake phrase itself, plus ``lead_ms`` and ``trail_ms`` of
+            padding, located from the decoder's per-word timings.  This is what
+            "send the audio that triggered it" means literally: the file is the
+            hotword and little else, typically well under a second.  Requires a
+            backend that reports timings; the gate falls back to :attr:`WINDOW`
+            per snippet when they are missing or fail their sanity check.
+        WINDOW: A fixed window -- ``pre_roll_ms`` before the detection and
+            ``post_roll_ms`` after it.  Captures the *command* following the
+            wake word, not just the trigger, and needs nothing from the decoder
+            beyond the text.
+    """
+
+    PHRASE = "phrase"
+    WINDOW = "window"
 
 DEFAULT_PHRASES: tuple[str, ...] = ("ok google", "hey google")
 """Phrases the gate listens for out of the box."""
@@ -108,6 +130,19 @@ class VoiceGateConfig:
             :func:`~echochamber.voicegate.matching.match_phrase`.
         model_path: Directory of the Vosk model, or ``None`` to leave the gate
             without a recogniser (it then never fires).
+        clip_mode: What each snippet is cut to; see :class:`ClipMode`.  Defaults
+            to :attr:`ClipMode.PHRASE`, so a snippet is the hotword rather than
+            a window around it.
+        lead_ms: Audio kept before the wake phrase in :attr:`ClipMode.PHRASE`.
+            Small on purpose -- enough to avoid clipping the initial consonant,
+            not enough to include whatever came before.
+        trail_ms: Audio kept after the wake phrase in :attr:`ClipMode.PHRASE`.
+        lookback_ms: How much recent audio is retained so a phrase can be cut
+            out of the past.  This is **not** how much ends up in the file: it
+            is the window the gate can reach back into, and it must comfortably
+            exceed the decoder's reporting lag, which for a small model running
+            behind a bounded queue is routinely a second or more.  Costs
+            ``lookback_ms`` of 16-bit mono -- 8 s is 256 KB.
         pre_roll_ms: Audio kept from *before* the match lands in the snippet.
             This is not cosmetic: the recogniser only reports a phrase once it
             has consumed the audio containing it, so without a pre-roll the
@@ -140,6 +175,10 @@ class VoiceGateConfig:
     enabled: bool = False
     phrases: tuple[str, ...] = DEFAULT_PHRASES
     model_path: str | None = None
+    clip_mode: ClipMode = ClipMode.PHRASE
+    lead_ms: int = 250
+    trail_ms: int = 250
+    lookback_ms: int = 8000
     pre_roll_ms: int = 1500
     post_roll_ms: int = 3000
     max_snippet_ms: int = 15_000
@@ -150,6 +189,17 @@ class VoiceGateConfig:
 
     def __post_init__(self) -> None:
         """Validate the configuration; see the class docstring for the rules."""
+        if self.lead_ms < 0:
+            raise ValueError(f"lead_ms must be >= 0, got {self.lead_ms}")
+        if self.trail_ms < 0:
+            raise ValueError(f"trail_ms must be >= 0, got {self.trail_ms}")
+        if self.lookback_ms <= 0:
+            raise ValueError(f"lookback_ms must be > 0, got {self.lookback_ms}")
+        if not isinstance(self.clip_mode, ClipMode):
+            raise TypeError(
+                f"clip_mode must be a ClipMode, got "
+                f"{type(self.clip_mode).__name__}"
+            )
         if self.pre_roll_ms < 0:
             raise ValueError(f"pre_roll_ms must be >= 0, got {self.pre_roll_ms}")
         if self.post_roll_ms < 0:
@@ -201,6 +251,44 @@ class VoiceGateConfig:
             if normalized:
                 seen.setdefault(normalized, None)
         return tuple(seen)
+
+    def lead_frames(self, sample_rate: int) -> int:
+        """Padding before the phrase, in frames at ``sample_rate``.
+
+        Args:
+            sample_rate: Capture sample rate in Hz.
+
+        Returns:
+            The frame count.
+        """
+        return ms_to_frames(self.lead_ms, sample_rate)
+
+    def trail_frames(self, sample_rate: int) -> int:
+        """Padding after the phrase, in frames at ``sample_rate``.
+
+        Args:
+            sample_rate: Capture sample rate in Hz.
+
+        Returns:
+            The frame count.
+        """
+        return ms_to_frames(self.trail_ms, sample_rate)
+
+    def lookback_frames(self, sample_rate: int) -> int:
+        """Retained-audio window, in frames at ``sample_rate``.
+
+        Args:
+            sample_rate: Capture sample rate in Hz.
+
+        Returns:
+            The frame count; at least enough to hold the configured pre-roll,
+            since :attr:`ClipMode.WINDOW` cuts out of the same buffer and a
+            lookback shorter than the pre-roll would silently shorten it.
+        """
+        return max(
+            ms_to_frames(self.lookback_ms, sample_rate),
+            self.pre_roll_frames(sample_rate),
+        )
 
     def pre_roll_frames(self, sample_rate: int) -> int:
         """Pre-roll length in frames at ``sample_rate``.

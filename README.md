@@ -55,11 +55,20 @@ follows a configured phrase — `"ok google"`, `"hey google"` — as one WAV sni
 python scripts/setup_voice_gate.py     # fetches the model, builds the recognizer venv
 ```
 
-It is a `ChunkSink` composed alongside the existing one, so nothing upstream changes. The
-snippet is seeded with `pre_roll_ms` of audio kept from *before* the match, because a
-recognizer only reports a phrase after consuming it — without the pre-roll the snippet
-would start after the phrase it is named for. Matching is on whole words, so `"ok google"`
-fires on `"ok google turn it up"` but not on `"look google it"`.
+It is a `ChunkSink` composed alongside the existing one, so nothing upstream changes.
+Matching is on whole words, so `"ok google"` fires on `"ok google turn it up"` but not on
+`"look google it"`.
+
+**The clip is the hotword, not a window around it.** Vosk reports per-word timestamps, and
+the gate uses them to cut exactly `[phrase start − lead_ms, phrase end + trail_ms]` out of
+its lookback buffer — about a second, instead of the 4.5 s guess a fixed pre/post-roll
+would produce. `ClipMode.WINDOW` restores that older behaviour when you want the *command*
+after the wake word rather than the wake word itself.
+
+If the timings are missing or fail a sanity check, the gate falls back to the window and
+counts it. Watch `clips_fallback`: a fallback clip is a *wider* clip, not a missing one, so
+the snippet count still climbs and the file still plays — that counter is the only thing
+that tells you the audio isn't the hotword it's named after.
 
 **`vosk` has no `win_arm64` wheel**, and the deployment target is Windows ARM64. So on
 ARM64 vosk is not installed into the main environment at all: it runs in a separate
@@ -85,8 +94,10 @@ Two events per utterance. `detected` goes out **the moment the phrase is recogni
 
 ```json
 {"type":"detected","phrase":"ok google","text":"ok google turn it up","seq":0,"sample_rate":16000,"timestamp":1786122719.665}
-{"type":"snippet","phrase":"ok google","seq":0,"path":"...","frames":16000,"duration_s":1.0,"truncated":false,"audio":{"encoding":"base64","format":"wav","bytes":32044,"data":"..."}}
+{"type":"snippet","phrase":"ok google","seq":0,"path":"...","frames":17600,"duration_s":1.1,"truncated":false,"audio":{"encoding":"base64","format":"wav","bytes":35244,"data":"..."}}
 ```
+
+The `audio` is the hotword clip itself (~1 s), so `include_audio` defaults on.
 
 Sending happens on its own thread behind a bounded queue — a socket write to a dead host
 takes a TCP timeout to fail, and doing that on the consumer thread would stall the

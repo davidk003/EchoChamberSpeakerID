@@ -148,6 +148,11 @@ class UiStats:
         gate_snippets: Snippet files completed.
         gate_suppressed: Matches ignored inside the cooldown after a snippet.
         gate_truncated: Snippets cut short by the maximum-length ceiling.
+        gate_located: Snippets cut to the phrase from the decoder's word
+            timings.
+        gate_fallback: Snippets that fell back to a fixed window for want of
+            timings.  Climbing in step with ``gate_snippets`` means every clip
+            is a wide guess rather than the hotword.
         gate_last_phrase: Most recently matched phrase; empty before the first.
         gate_last_path: Path of the most recent snippet, or ``None``.
         gate_error: Whatever the gate last failed at, or ``None``.  A gate that
@@ -183,6 +188,8 @@ class UiStats:
     gate_snippets: int = 0
     gate_suppressed: int = 0
     gate_truncated: int = 0
+    gate_located: int = 0
+    gate_fallback: int = 0
     gate_last_phrase: str = ""
     gate_last_path: str | None = None
     gate_error: str | None = None
@@ -967,6 +974,8 @@ class CaptureController(QObject):
             gate_snippets=gate.snippets_written,
             gate_suppressed=gate.snippets_suppressed,
             gate_truncated=gate.snippets_truncated,
+            gate_located=gate.clips_located,
+            gate_fallback=gate.clips_fallback,
             gate_last_phrase=gate.last_phrase,
             gate_last_path=gate.last_snippet_path,
             gate_error=gate.error,
