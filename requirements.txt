@@ -3,3 +3,4 @@
 # before adding anything new here (this already ruled out soxr).
 numpy>=2.0
 sounddevice>=0.5.5
+PySide6>=6.11

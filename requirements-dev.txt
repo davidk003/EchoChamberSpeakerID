@@ -3,3 +3,6 @@
 # before adding anything new here.
 -r requirements.txt
 pytest>=8
+# pytest-qt is pure Python, so it carries no ARM64 wheel risk.
+# GUI tests need QT_QPA_PLATFORM=offscreen; see tests/test_ui_*.py.
+pytest-qt>=4.5

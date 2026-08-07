@@ -220,6 +220,13 @@ PySide6. The audio path never calls into Qt directly.
   per chunk would flood the event loop, and the display can't show more than ~60 Hz anyway.
   Note `peak_level` / `rms_level` are *last block only*, not a running maximum, so the meter
   needs its own decay/hold — read naively at shutdown it shows ~0 even after a loud session.
+  `PeakHold` does this, and takes `now` as an argument rather than reading the clock, which is
+  what makes its decay testable rather than timing-dependent.
+
+  **The poll timer must be a `Qt.PreciseTimer`.** With Qt's default `CoarseTimer` the 33 ms
+  interval gets rounded to the Windows scheduler tick and measured **21 Hz, not 30** — a third
+  of the frames silently missing, with nothing to indicate why. Measured 30.1 Hz with
+  `PreciseTimer`.
 - Rare events (device error, stream stopped, discontinuity) do use queued `Signal`s.
 - Widgets: device selector, start/stop, `window_ms` / `hop_ms` spinboxes with a live "overlap:
   N ms (P %)" readout, level meter, scrolling waveform, and a stats panel showing dropped
@@ -301,6 +308,7 @@ becomes a problem.
    bounded queue and consumer thread)
 4. ~~`sounddevice_source.py` + device enumeration — first live audio~~ — **done**
    (545 tests passing; verified against real hardware at 16 kHz from a 48 kHz WASAPI device)
-5. GUI: device panel, start/stop, meters, stats
+5. ~~GUI: device panel, start/stop, meters, stats~~ — **done** (656 tests passing; verified
+   driving a live microphone at 30.1 Hz with no thread outliving the window)
 6. Latency instrumentation + a stub consumer standing in for the ML stage
 ```
