@@ -4,13 +4,35 @@ Low-latency Windows audio capture that turns a live microphone (or a WAV file) i
 **configurable overlapping windows**, ready to hand to an audio classification model.
 The ML stage is deliberately out of scope: the pipeline ends at a pluggable sink.
 
+## Requirements
+
+- Windows 10/11 (x86-64 or ARM64)
+- Python 3.11+
+- A microphone (optional — you can also feed it a WAV file)
+
 ## Quick start
 
 ```bash
+# 1. Clone the repo and enter it
+git clone <this-repo-url>
+cd EchoChamberSpeakerID
+
+# 2. (Recommended) create and activate a virtual environment
+python -m venv .venv
+.venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements-dev.txt
-python -m echochamber.app          # GUI: pick a device, start, watch the meters
-pytest                             # 600+ tests, no microphone required
+
+# 4. Launch the GUI: pick an input device, click start, watch the meters
+python -m echochamber.app
+
+# 5. (Optional) run the test suite — no microphone needed
+pytest
 ```
+
+That's it — the app runs standalone with no extra setup. The wake-phrase
+voice gate below is an optional extra you can add later.
 
 ## What it does
 
@@ -51,9 +73,15 @@ pytest                             # 600+ tests, no microphone required
 Off by default. When enabled, the pipeline stops keeping everything and keeps only what
 follows a configured phrase — `"ok google"`, `"hey google"` — as one WAV snippet each.
 
+To turn it on:
+
 ```bash
+pip install .[voice-gate]              # x86-64 only, skip on ARM64 — see below
 python scripts/setup_voice_gate.py     # fetches the model, builds the recognizer venv
 ```
+
+The script prints a `worker_python` path and a `model_path` — pass both into
+`VoiceGateConfig(enabled=True, ...)` in your app config.
 
 It is a `ChunkSink` composed alongside the existing one, so nothing upstream changes.
 Matching is on whole words, so `"ok google"` fires on `"ok google turn it up"` but not on
